@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-ZOV PnL BOT v2.0 - Единый монолитный файл
+ZOV PnL BOT v3.0 - Исправленная версия
 Боевое решение для подсчёта ежедневного PnL TON-кошелька
-Курсы валют: TON/USD через TonAPI, USD/RUB через Coingecko
 """
 
+import os  # <--- ДОБАВЛЕН ИМПОРТ
 import json
 import asyncio
 from datetime import datetime, date, timezone, timedelta
@@ -32,12 +32,11 @@ COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 # --- Настройки хранения ---
 STATS_FILE = "stats.json"
 
-
 # ==================== МОДУЛЬ РАБОТЫ С ХРАНИЛИЩЕМ ====================
 
 class Storage:
     """Класс для хранения статистики в JSON-файле"""
-
+    
     def __init__(self, filename: str = STATS_FILE):
         self.filename = filename
         self._ensure_file()
@@ -51,13 +50,13 @@ class Storage:
     async def get_today_stats(self, address: str) -> Dict:
         async with self._lock:
             today = date.today().isoformat()
-
+            
             with open(self.filename, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
+            
             if address not in data:
                 data[address] = {}
-
+            
             if today not in data[address]:
                 data[address][today] = {
                     'incoming': 0.0,
@@ -66,54 +65,53 @@ class Storage:
                 }
                 with open(self.filename, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
-
+            
             return data[address][today].copy()
 
     async def update_stats(self, address: str, incoming: float, outgoing: float, tx_count: int = 0) -> None:
         async with self._lock:
             today = date.today().isoformat()
-
+            
             with open(self.filename, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
+            
             if address not in data:
                 data[address] = {}
-
+            
             if today not in data[address]:
                 data[address][today] = {
                     'incoming': 0.0,
                     'outgoing': 0.0,
                     'tx_count': 0
                 }
-
+            
             data[address][today]['incoming'] += incoming
             data[address][today]['outgoing'] += outgoing
             data[address][today]['tx_count'] += tx_count
-
+            
             with open(self.filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
     async def clear_old_stats(self, days: int = 30) -> None:
         async with self._lock:
             cutoff = date.today() - timedelta(days=days)
-
+            
             with open(self.filename, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
+            
             for address in data:
                 for d in list(data[address].keys()):
                     if datetime.strptime(d, '%Y-%m-%d').date() < cutoff:
                         del data[address][d]
-
+            
             with open(self.filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-
 
 # ==================== МОДУЛЬ РАБОТЫ С TONAPI ====================
 
 class TONClient:
     """Клиент для работы с TonAPI (tonapi.io)"""
-
+    
     def __init__(self, api_key: str = TONAPI_KEY):
         self.api_key = api_key
         self.base_url = TONAPI_BASE_URL
@@ -129,7 +127,7 @@ class TONClient:
             'limit': limit,
             'sort': 'desc'
         }
-
+        
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=self.headers) as resp:
                 if resp.status != 200:
@@ -145,7 +143,7 @@ class TONClient:
             'tokens': 'ton',
             'currencies': 'usd'
         }
-
+        
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=self.headers) as resp:
                 if resp.status != 200:
@@ -158,7 +156,7 @@ class TONClient:
     async def get_account_info(self, address: str) -> Dict:
         """Получение информации о кошельке (баланс и т.д.)"""
         url = f"{self.base_url}/blockchain/account/{address}"
-
+        
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=self.headers) as resp:
                 if resp.status != 200:
@@ -166,12 +164,11 @@ class TONClient:
                     raise Exception(f"TonAPI error {resp.status}: {error_text}")
                 return await resp.json()
 
-
 # ==================== МОДУЛЬ РАБОТЫ С КУРСАМИ ВАЛЮТ ====================
 
 class CurrencyRates:
     """Получение актуальных курсов валют"""
-
+    
     @staticmethod
     async def get_usd_rub_rate() -> float:
         """
@@ -179,7 +176,7 @@ class CurrencyRates:
         Возвращает курс (например, 90.0)
         """
         url = f"{COINGECKO_BASE_URL}/exchange_rates"
-
+        
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(url) as resp:
@@ -193,7 +190,7 @@ class CurrencyRates:
                     return await CurrencyRates._get_usd_rub_alternative()
             except Exception:
                 return await CurrencyRates._get_usd_rub_alternative()
-
+    
     @staticmethod
     async def _get_usd_rub_alternative() -> float:
         """Альтернативный способ получения курса USD/RUB"""
@@ -208,18 +205,15 @@ class CurrencyRates:
                 pass
         return 90.0  # fallback значение
 
-
 # ==================== ОСНОВНАЯ ЛОГИКА БОТА ====================
 
 storage = Storage()
 ton_client = TONClient()
 currency = CurrencyRates()
 
-
 def parse_ton_amount(value: int) -> float:
     """Перевод из наноTON в TON (1 TON = 10^9 наноTON)"""
     return value / 1e9
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
@@ -230,7 +224,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/balance - текущий баланс кошелька\n"
         "/clear - очистить статистику старше 30 дней"
     )
-
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /stats — формирует отчёт PnL за сегодня"""
@@ -254,7 +247,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Анализ входящих и исходящих сообщений
             in_msg = tx.get('in_msg', {})
             out_msgs = tx.get('out_msgs', [])
-
+            
             # Проверяем входящую транзакцию
             if in_msg and in_msg.get('value', 0) > 0:
                 # Если исходящих нет или это служебные, считаем пополнением
@@ -278,7 +271,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Сохраняем статистику
         await storage.update_stats(WALLET_ADDRESS, incoming, outgoing, tx_count)
         daily_stats = await storage.get_today_stats(WALLET_ADDRESS)
-
+        
         total_incoming = daily_stats['incoming']
         total_outgoing = daily_stats['outgoing']
         pnl_ton = total_incoming - total_outgoing
@@ -292,7 +285,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Формируем отчёт
         status = "🔥 ПРИБЫЛЬ" if pnl_ton > 0 else "⚠️ УБЫТОК" if pnl_ton < 0 else "⏸️ НУЛЬ"
-
+        
         report = (
             f"📊 **ОТЧЁТ ZOV PnL**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -315,22 +308,21 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка, мой господин: {str(e)}")
 
-
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /balance — показывает текущий баланс кошелька"""
     await update.message.reply_text("🔄 Запрашиваю баланс, мой господин...")
-
+    
     try:
         account_info = await ton_client.get_account_info(WALLET_ADDRESS)
         balance_nano = account_info.get('balance', 0)
         balance_ton = parse_ton_amount(balance_nano)
-
+        
         ton_usd_price = await ton_client.get_ton_usd_price()
         usd_rub_price = await currency.get_usd_rub_rate()
-
+        
         balance_usd = balance_ton * ton_usd_price
         balance_rub = balance_usd * usd_rub_price
-
+        
         msg = (
             f"🏦 **БАЛАНС КОШЕЛЬКА**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -342,38 +334,33 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💱 USD/RUB = {usd_rub_price:.2f}"
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
-
+        
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-
 
 async def clear_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Очистка старой статистики"""
     await storage.clear_old_stats(30)
     await update.message.reply_text("✅ Статистика старше 30 дней очищена, мой господин.")
 
-
 # ==================== ЗАПУСК БОТА ====================
 
 def main():
     """Главная функция запуска бота"""
-    print("🇷🇺 ZOV PnL BOT v2.0 запускается, мой господин...")
+    print("🇷🇺 ZOV PnL BOT v3.0 запускается, мой господин...")
     print(f"📍 Кошелёк: {WALLET_ADDRESS}")
     print(f"📁 Файл статистики: {STATS_FILE}")
-
+    
     app = Application.builder().token(BOT_TOKEN).build()
-
+    
     # Регистрируем команды
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('stats', stats))
     app.add_handler(CommandHandler('balance', balance))
     app.add_handler(CommandHandler('clear', clear_stats))
-
+    
     print("✅ Бот готов к работе. Ожидаю приказов.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
 if __name__ == '__main__':
-    import os  # для работы с файлами
-
     main()
