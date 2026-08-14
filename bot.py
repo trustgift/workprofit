@@ -1,1377 +1,1598 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-ZOV UserBot System v3.0 - ПОЛНАЯ РАБОЧАЯ ВЕРСИЯ
-Юзерботы мониторят группу и кидают кнопки в ЛС админу
+Telegram UserBot Manager
+- Telethon user accounts
+- Monitoring one Telegram group for @usernames
+- Manual approval: "Написать" / "Пропустить"
+- Manual username adding
+- Two-step message flow: first text -> wait for reply -> second text
+- Reply forwarding to an admin group
+- Per-account monitoring switch
+- Error / flood notifications
+- SQLite persistence
 """
 
-import os
-import re
-import sqlite3
 import asyncio
 import logging
-from datetime import datetime
-from typing import Dict, List, Optional
-
-# ==================== НАСТРОЙКА ====================
-
-BOT_TOKEN = "8849260350:AAH3YDz5Qz6KfkfTCSPO2mzRu6nGUkrcGtY"
-API_ID = 20734425
-API_HASH = "f72fa8d1d63a8f984e47a115c76df123"
-ADMIN_IDS = [8772186742, 8986358602, 6126473786]
-
-SESSIONS_DIR = "sessions"
-DATABASE_FILE = "data.db"
-
-os.makedirs(SESSIONS_DIR, exist_ok=True)
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ==================== ИМПОРТЫ ====================
+import re
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 from telethon import TelegramClient, events
 from telethon.errors import (
     FloodWaitError,
-    PhoneCodeInvalidError,
+    PeerFloodError,
+    UserPrivacyRestrictedError,
+    UserNotMutualContactError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+    RPCError,
     SessionPasswordNeededError,
-    PhoneNumberInvalidError,
-    PhoneCodeExpiredError,
-    PeerFloodError
+    PhoneCodeInvalidError,
 )
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
-    ContextTypes,
-    ConversationHandler
 )
 
-# Состояния
-AUTH_PHONE, AUTH_CODE, AUTH_PASSWORD = range(3)
-ADD_GROUP = 10
-ADD_REPLY_GROUP = 11
-EDIT_TEXTS = 20
+# ============================================================
+# CONFIG
+# ============================================================
+# НЕ вставляй сюда старый токен из присланного файла.
+# Сначала отзови его через BotFather и создай новый.
+BOT_TOKEN = "8849260350:AAH3YDz5Qz6KfkfTCSPO2mzRu6nGUkrcGtY"
+API_ID = 20734425
+API_HASH = "f72fa8d1d63a8f984e47a115c76df123"
 
-# ==================== БАЗА ДАННЫХ ====================
+ADMIN_IDS = {
+    8772186742,8986358602 # замени на свои Telegram user ID
+}
 
+SESSIONS_DIR = Path("sessions")
+DATABASE_FILE = Path("data.db")
+
+SESSIONS_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("userbot-manager")
+
+USERNAME_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_]{5,32})(?![\w])")
+
+# Conversation states
+(
+    AUTH_PHONE,
+    AUTH_CODE,
+    AUTH_PASSWORD,
+    ADD_GROUP,
+    ADD_REPLY_GROUP,
+    EDIT_TEXT_1,
+    EDIT_TEXT_2,
+    MANUAL_USERNAME,
+) = range(8)
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 class Database:
-    def __init__(self):
-        self.db_file = DATABASE_FILE
-        self._init_db()
-    
-    def _init_db(self):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            
-            # Аккаунты
-            c.execute('''
+    def __init__(self, path: Path):
+        self.path = str(path)
+        self._init()
+
+    def connect(self):
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    def _init(self):
+        with closing(self.connect()) as db:
+            db.executescript(
+                """
                 CREATE TABLE IF NOT EXISTS accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT UNIQUE,
-                    session_name TEXT UNIQUE,
-                    is_active INTEGER DEFAULT 1,
-                    is_monitoring INTEGER DEFAULT 1,
-                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Группа для мониторинга (одна)
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS monitor_group (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_id TEXT UNIQUE,
-                    group_name TEXT
-                )
-            ''')
-            
-            # Группа для ответов
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS reply_group (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_id TEXT UNIQUE,
-                    group_name TEXT
-                )
-            ''')
-            
-            # Тексты (1-й и 2-й)
-            c.execute('''
+                    phone TEXT NOT NULL UNIQUE,
+                    session_name TEXT NOT NULL UNIQUE,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    is_monitoring INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS texts (
+                    step INTEGER PRIMARY KEY,
+                    text TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS contacts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    step INTEGER UNIQUE,
-                    text TEXT
-                )
-            ''')
-            c.execute("INSERT OR IGNORE INTO texts (step, text) VALUES (1, 'Привет! Как дела?')")
-            c.execute("INSERT OR IGNORE INTO texts (step, text) VALUES (2, 'Отлично! Чем могу помочь?')")
-            
-            # Найденные пользователи
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS found_users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT,
+                    account_id INTEGER NOT NULL,
+                    username TEXT NOT NULL,
                     user_id TEXT,
-                    account_id INTEGER,
-                    found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'pending',
-                    processed_by INTEGER,
-                    FOREIGN KEY (account_id) REFERENCES accounts(id)
-                )
-            ''')
-            
-            # Очередь сообщений
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS message_queue (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id INTEGER,
-                    username TEXT,
-                    step INTEGER DEFAULT 1,
-                    status TEXT DEFAULT 'pending',
-                    error_text TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (account_id) REFERENCES accounts(id)
-                )
-            ''')
-            
-            # Ответы пользователей
-            c.execute('''
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    first_sent_at TEXT,
+                    replied_at TEXT,
+                    second_sent_at TEXT,
+                    last_error TEXT,
+                    UNIQUE(account_id, username),
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS replies (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id INTEGER,
-                    username TEXT,
+                    contact_id INTEGER,
+                    account_id INTEGER NOT NULL,
+                    username TEXT NOT NULL,
                     user_id TEXT,
-                    reply_text TEXT,
-                    replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Статистика
-            c.execute('''
+                    text TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE SET NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS stats (
                     account_id INTEGER PRIMARY KEY,
-                    sent INTEGER DEFAULT 0,
-                    replies INTEGER DEFAULT 0,
-                    errors INTEGER DEFAULT 0,
-                    FOREIGN KEY (account_id) REFERENCES accounts(id)
-                )
-            ''')
-            
-            conn.commit()
-    
-    # ============ АККАУНТЫ ============
-    
-    def add_account(self, phone: str, session_name: str) -> int:
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT OR REPLACE INTO accounts (phone, session_name) VALUES (?, ?)",
-                (phone, session_name)
-            )
-            account_id = c.lastrowid
-            c.execute("INSERT OR IGNORE INTO stats (account_id) VALUES (?)", (account_id,))
-            conn.commit()
-            return account_id
-    
-    def get_accounts(self, active_only: bool = True) -> List[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            query = """
-                SELECT a.*, s.sent, s.replies, s.errors 
-                FROM accounts a
-                LEFT JOIN stats s ON a.id = s.account_id
-            """
-            if active_only:
-                query += " WHERE a.is_active = 1"
-            c.execute(query)
-            return [dict(row) for row in c.fetchall()]
-    
-    def get_account_by_phone(self, phone: str) -> Optional[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute("SELECT * FROM accounts WHERE phone = ?", (phone,))
-            row = c.fetchone()
-            return dict(row) if row else None
-    
-    def get_account(self, account_id: int) -> Optional[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
-            row = c.fetchone()
-            return dict(row) if row else None
-    
-    def toggle_account(self, account_id: int, active: bool):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "UPDATE accounts SET is_active = ? WHERE id = ?",
-                (1 if active else 0, account_id)
-            )
-            conn.commit()
-    
-    def toggle_monitoring(self, account_id: int, active: bool):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "UPDATE accounts SET is_monitoring = ? WHERE id = ?",
-                (1 if active else 0, account_id)
-            )
-            conn.commit()
-    
-    def delete_account(self, account_id: int):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-            c.execute("DELETE FROM stats WHERE account_id = ?", (account_id,))
-            conn.commit()
-    
-    # ============ ГРУППЫ ============
-    
-    def set_monitor_group(self, group_id: str, group_name: str):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM monitor_group")
-            c.execute(
-                "INSERT INTO monitor_group (group_id, group_name) VALUES (?, ?)",
-                (group_id, group_name)
-            )
-            conn.commit()
-    
-    def get_monitor_group(self) -> Optional[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute("SELECT * FROM monitor_group LIMIT 1")
-            row = c.fetchone()
-            return dict(row) if row else None
-    
-    def set_reply_group(self, group_id: str, group_name: str):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM reply_group")
-            c.execute(
-                "INSERT INTO reply_group (group_id, group_name) VALUES (?, ?)",
-                (group_id, group_name)
-            )
-            conn.commit()
-    
-    def get_reply_group(self) -> Optional[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute("SELECT * FROM reply_group LIMIT 1")
-            row = c.fetchone()
-            return dict(row) if row else None
-    
-    # ============ ТЕКСТЫ ============
-    
-    def get_text(self, step: int) -> Optional[str]:
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute("SELECT text FROM texts WHERE step = ?", (step,))
-            row = c.fetchone()
-            return row[0] if row else None
-    
-    def set_text(self, step: int, text: str):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT OR REPLACE INTO texts (step, text) VALUES (?, ?)",
-                (step, text)
-            )
-            conn.commit()
-    
-    # ============ НАЙДЕННЫЕ ПОЛЬЗОВАТЕЛИ ============
-    
-    def save_found_user(self, username: str, account_id: int, user_id: str = None):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT * FROM found_users WHERE username = ? AND status = 'pending'",
-                (username,)
-            )
-            if c.fetchone():
-                return
-            c.execute(
-                "INSERT INTO found_users (username, user_id, account_id) VALUES (?, ?, ?)",
-                (username, user_id, account_id)
-            )
-            conn.commit()
-    
-    def get_pending_users(self) -> List[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute(
-                "SELECT * FROM found_users WHERE status = 'pending' ORDER BY found_at"
-            )
-            return [dict(row) for row in c.fetchall()]
-    
-    def get_pending_users_by_account(self, account_id: int) -> List[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute(
-                "SELECT * FROM found_users WHERE status = 'pending' AND account_id = ? ORDER BY found_at",
-                (account_id,)
-            )
-            return [dict(row) for row in c.fetchall()]
-    
-    def update_found_status(self, user_id: int, status: str, processed_by: int = None):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "UPDATE found_users SET status = ?, processed_by = ? WHERE id = ?",
-                (status, processed_by, user_id)
-            )
-            conn.commit()
-    
-    def skip_found_user(self, user_id: int):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "UPDATE found_users SET status = 'skipped' WHERE id = ?",
-                (user_id,)
-            )
-            conn.commit()
-    
-    # ============ ОЧЕРЕДЬ ============
-    
-    def add_to_queue(self, account_id: int, username: str, step: int = 1):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO message_queue (account_id, username, step) VALUES (?, ?, ?)",
-                (account_id, username, step)
-            )
-            conn.commit()
-            return c.lastrowid
-    
-    def get_queue(self) -> List[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute(
-                "SELECT * FROM message_queue WHERE status = 'pending' ORDER BY created_at"
-            )
-            return [dict(row) for row in c.fetchall()]
-    
-    def get_queue_by_username(self, username: str, account_id: int) -> List[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute(
-                "SELECT * FROM message_queue WHERE username = ? AND account_id = ? AND status = 'pending'",
-                (username, account_id)
-            )
-            return [dict(row) for row in c.fetchall()]
-    
-    def update_queue_status(self, queue_id: int, status: str, error: str = None):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "UPDATE message_queue SET status = ?, error_text = ? WHERE id = ?",
-                (status, error, queue_id)
-            )
-            conn.commit()
-    
-    def update_queue_step(self, queue_id: int, step: int):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "UPDATE message_queue SET step = ? WHERE id = ?",
-                (step, queue_id)
-            )
-            conn.commit()
-    
-    def get_queue_stats(self) -> Dict:
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM message_queue WHERE status = 'pending'")
-            pending = c.fetchone()[0]
-            c.execute("SELECT COUNT(*) FROM message_queue WHERE status = 'sent'")
-            sent = c.fetchone()[0]
-            c.execute("SELECT COUNT(*) FROM message_queue WHERE status = 'error' OR status = 'blocked'")
-            errors = c.fetchone()[0]
-            return {'pending': pending, 'sent': sent, 'errors': errors}
-    
-    # ============ ОТВЕТЫ ============
-    
-    def save_reply(self, account_id: int, username: str, user_id: str, text: str):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO replies (account_id, username, user_id, reply_text) VALUES (?, ?, ?, ?)",
-                (account_id, username, user_id, text)
-            )
-            conn.commit()
-    
-    def get_replies(self) -> List[Dict]:
-        with sqlite3.connect(self.db_file) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute(
-                "SELECT * FROM replies ORDER BY replied_at DESC LIMIT 20"
-            )
-            return [dict(row) for row in c.fetchall()]
-    
-    # ============ СТАТИСТИКА ============
-    
-    def inc_stats(self, account_id: int, field: str):
-        with sqlite3.connect(self.db_file) as conn:
-            c = conn.cursor()
-            c.execute(
-                f"UPDATE stats SET {field} = {field} + 1 WHERE account_id = ?",
-                (account_id,)
-            )
-            conn.commit()
+                    sent_first INTEGER NOT NULL DEFAULT 0,
+                    sent_second INTEGER NOT NULL DEFAULT 0,
+                    replies INTEGER NOT NULL DEFAULT 0,
+                    errors INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
 
-# ==================== ЮЗЕРБОТ МЕНЕДЖЕР ====================
+                INSERT OR IGNORE INTO texts(step, text)
+                VALUES(1, 'Привет!');
+
+                INSERT OR IGNORE INTO texts(step, text)
+                VALUES(2, 'Спасибо за ответ!');
+                """
+            )
+            db.commit()
+
+    # ---------- settings ----------
+    def set_setting(self, key: str, value: str):
+        with closing(self.connect()) as db:
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            db.commit()
+
+    def get_setting(self, key: str) -> Optional[str]:
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            ).fetchone()
+            return row["value"] if row else None
+
+    # ---------- accounts ----------
+    def add_account(self, phone: str, session_name: str) -> int:
+        with closing(self.connect()) as db:
+            cur = db.execute(
+                "INSERT INTO accounts(phone,session_name) VALUES(?,?)",
+                (phone, session_name),
+            )
+            account_id = cur.lastrowid
+            db.execute("INSERT OR IGNORE INTO stats(account_id) VALUES(?)", (account_id,))
+            db.commit()
+            return int(account_id)
+
+    def get_accounts(self, include_inactive=True):
+        with closing(self.connect()) as db:
+            sql = "SELECT * FROM accounts"
+            if not include_inactive:
+                sql += " WHERE is_active=1"
+            sql += " ORDER BY id"
+            return [dict(x) for x in db.execute(sql).fetchall()]
+
+    def get_account(self, account_id: int):
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT * FROM accounts WHERE id=?", (account_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_account_by_phone(self, phone: str):
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT * FROM accounts WHERE phone=?", (phone,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_account_active(self, account_id: int, active: bool):
+        with closing(self.connect()) as db:
+            db.execute(
+                "UPDATE accounts SET is_active=? WHERE id=?",
+                (int(active), account_id),
+            )
+            db.commit()
+
+    def set_monitoring(self, account_id: int, enabled: bool):
+        with closing(self.connect()) as db:
+            db.execute(
+                "UPDATE accounts SET is_monitoring=? WHERE id=?",
+                (int(enabled), account_id),
+            )
+            db.commit()
+
+    def delete_account(self, account_id: int):
+        with closing(self.connect()) as db:
+            db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+            db.commit()
+
+    # ---------- texts ----------
+    def get_text(self, step: int) -> str:
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT text FROM texts WHERE step=?", (step,)
+            ).fetchone()
+            return row["text"] if row else ""
+
+    def set_text(self, step: int, text: str):
+        with closing(self.connect()) as db:
+            db.execute(
+                "INSERT INTO texts(step,text) VALUES(?,?) "
+                "ON CONFLICT(step) DO UPDATE SET text=excluded.text",
+                (step, text),
+            )
+            db.commit()
+
+    # ---------- contacts ----------
+    def add_contact(
+        self,
+        account_id: int,
+        username: str,
+        source: str = "manual",
+        user_id: Optional[str] = None,
+    ):
+        username = username.lstrip("@").strip().lower()
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT * FROM contacts WHERE account_id=? AND username=?",
+                (account_id, username),
+            ).fetchone()
+            if row:
+                return dict(row), False
+
+            cur = db.execute(
+                """
+                INSERT INTO contacts(account_id,username,user_id,source,status)
+                VALUES(?,?,?,?, 'pending')
+                """,
+                (account_id, username, user_id, source),
+            )
+            contact_id = cur.lastrowid
+            db.commit()
+            row = db.execute(
+                "SELECT * FROM contacts WHERE id=?", (contact_id,)
+            ).fetchone()
+            return dict(row), True
+
+    def get_contact(self, contact_id: int):
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT * FROM contacts WHERE id=?", (contact_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_contact_for_user(self, account_id: int, username: str):
+        username = username.lstrip("@").lower()
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT * FROM contacts WHERE account_id=? AND username=?",
+                (account_id, username),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_pending(self, limit=50):
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                """
+                SELECT c.*, a.phone, a.session_name
+                FROM contacts c
+                JOIN accounts a ON a.id=c.account_id
+                WHERE c.status='pending'
+                ORDER BY c.id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(x) for x in rows]
+
+    def set_contact_status(
+        self,
+        contact_id: int,
+        status: str,
+        *,
+        error: Optional[str] = None,
+    ):
+        with closing(self.connect()) as db:
+            db.execute(
+                """
+                UPDATE contacts
+                SET status=?, last_error=?
+                WHERE id=?
+                """,
+                (status, error, contact_id),
+            )
+            db.commit()
+
+    def mark_first_sent(self, contact_id: int):
+        with closing(self.connect()) as db:
+            db.execute(
+                """
+                UPDATE contacts
+                SET status='waiting_reply',
+                    first_sent_at=CURRENT_TIMESTAMP,
+                    last_error=NULL
+                WHERE id=?
+                """,
+                (contact_id,),
+            )
+            db.commit()
+
+    def mark_reply(self, contact_id: int):
+        with closing(self.connect()) as db:
+            db.execute(
+                """
+                UPDATE contacts
+                SET status='reply_received',
+                    replied_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (contact_id,),
+            )
+            db.commit()
+
+    def mark_second_sent(self, contact_id: int):
+        with closing(self.connect()) as db:
+            db.execute(
+                """
+                UPDATE contacts
+                SET status='second_sent',
+                    second_sent_at=CURRENT_TIMESTAMP,
+                    last_error=NULL
+                WHERE id=?
+                """,
+                (contact_id,),
+            )
+            db.commit()
+
+    def save_reply(
+        self,
+        contact_id: Optional[int],
+        account_id: int,
+        username: str,
+        user_id: Optional[str],
+        text: str,
+    ):
+        with closing(self.connect()) as db:
+            db.execute(
+                """
+                INSERT INTO replies(contact_id,account_id,username,user_id,text)
+                VALUES(?,?,?,?,?)
+                """,
+                (contact_id, account_id, username, user_id, text),
+            )
+            db.commit()
+
+    def increment_stat(self, account_id: int, field: str):
+        allowed = {"sent_first", "sent_second", "replies", "errors"}
+        if field not in allowed:
+            raise ValueError("Invalid stats field")
+        with closing(self.connect()) as db:
+            db.execute(
+                f"UPDATE stats SET {field}={field}+1 WHERE account_id=?",
+                (account_id,),
+            )
+            db.commit()
+
+    def get_stats(self):
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                """
+                SELECT a.id,a.phone,
+                       COALESCE(s.sent_first,0) sent_first,
+                       COALESCE(s.sent_second,0) sent_second,
+                       COALESCE(s.replies,0) replies,
+                       COALESCE(s.errors,0) errors
+                FROM accounts a
+                LEFT JOIN stats s ON s.account_id=a.id
+                ORDER BY a.id
+                """
+            ).fetchall()
+            return [dict(x) for x in rows]
+
+    def pending_count(self):
+        with closing(self.connect()) as db:
+            return db.execute(
+                "SELECT COUNT(*) FROM contacts WHERE status='pending'"
+            ).fetchone()[0]
+
+
+# ============================================================
+# USERBOT MANAGER
+# ============================================================
+@dataclass
+class RunningAccount:
+    client: TelegramClient
+    phone: str
+
 
 class UserBotManager:
-    def __init__(self, db: Database, bot_app=None):
+    def __init__(self, db: Database, bot: "BotSystem"):
         self.db = db
-        self.bot_app = bot_app
-        self.clients = {}
-        self.running = True
-    
-    def set_bot_app(self, bot_app):
-        self.bot_app = bot_app
-    
-    async def start_account(self, account_id: int, phone: str, session_name: str):
+        self.bot = bot
+        self.clients: dict[int, RunningAccount] = {}
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    def lock_for(self, account_id: int):
+        if account_id not in self._locks:
+            self._locks[account_id] = asyncio.Lock()
+        return self._locks[account_id]
+
+    async def start_account(self, account: dict) -> bool:
+        account_id = account["id"]
+
         if account_id in self.clients:
-            return
-        
-        session_path = f"{SESSIONS_DIR}/{session_name}"
+            return True
+
+        session_path = str(SESSIONS_DIR / account["session_name"])
         client = TelegramClient(session_path, API_ID, API_HASH)
-        
+
         try:
-            await client.start(phone=phone)
-            
-            self.clients[account_id] = {
-                'client': client,
-                'phone': phone
-            }
-            
-            # Обработчик входящих личных сообщений (ответы)
+            await client.connect()
+
+            if not await client.is_user_authorized():
+                logger.warning(
+                    "Session %s is not authorized; account stays offline.",
+                    account["phone"],
+                )
+                await client.disconnect()
+                return False
+
+            running = RunningAccount(client=client, phone=account["phone"])
+            self.clients[account_id] = running
+
             @client.on(events.NewMessage(incoming=True))
-            async def handle_incoming(event):
-                await self._handle_incoming(account_id, event)
-            
-            # Обработчик новых сообщений в группах
-            @client.on(events.NewMessage)
-            async def handle_group_message(event):
-                await self._handle_group_message(account_id, event)
-            
-            logger.info(f"✅ Юзербот {phone} запущен")
-            return client
-            
-        except Exception as e:
-            logger.error(f"Ошибка запуска {phone}: {e}")
-            return None
-    
-    async def stop_account(self, account_id: int):
-        if account_id in self.clients:
+            async def incoming_handler(event):
+                try:
+                    await self.handle_private_message(account_id, event)
+                except Exception:
+                    logger.exception("Private message handler failed")
+
+            @client.on(events.NewMessage())
+            async def group_handler(event):
+                try:
+                    await self.handle_group_message(account_id, event)
+                except Exception:
+                    logger.exception("Group message handler failed")
+
+            logger.info("Account started: %s", account["phone"])
+            return True
+
+        except Exception:
+            logger.exception("Cannot start account %s", account["phone"])
             try:
-                await self.clients[account_id]['client'].disconnect()
-                del self.clients[account_id]
-                logger.info(f"✅ Юзербот {account_id} остановлен")
-            except Exception as e:
-                logger.error(f"Ошибка остановки {account_id}: {e}")
-    
-    async def _handle_group_message(self, account_id: int, event):
-        """Обработка сообщений в группах - поиск юзернеймов"""
+                await client.disconnect()
+            except Exception:
+                pass
+            return False
+
+    async def stop_account(self, account_id: int):
+        running = self.clients.pop(account_id, None)
+        if not running:
+            return
+
         try:
-            if not event.is_group:
-                return
-            
-            # Проверяем мониторинг
-            account = self.db.get_account(account_id)
-            if not account or not account.get('is_monitoring', 1):
-                return
-            
-            # Проверяем группу
-            monitor_group = self.db.get_monitor_group()
-            if not monitor_group:
-                return
-            
-            chat_id = str(event.chat_id)
-            if chat_id != monitor_group['group_id']:
-                return
-            
-            msg = event.message
-            if not msg.text:
-                return
-            
-            # Ищем юзернеймы
-            usernames = re.findall(r'@(\w+)', msg.text)
-            
-            for username in usernames:
-                pending = self.db.get_pending_users_by_account(account_id)
-                if any(u['username'] == username for u in pending):
-                    continue
-                
-                self.db.save_found_user(username, account_id)
-                await self._send_buttons_to_admin(username, account_id, account['phone'])
-                
-        except Exception as e:
-            logger.error(f"Ошибка обработки сообщения группы: {e}")
-    
-    async def _send_buttons_to_admin(self, username: str, account_id: int, phone: str):
-        """Отправка кнопок админу"""
+            await running.client.disconnect()
+        except Exception:
+            logger.exception("Error stopping account %s", account_id)
+
+    async def restart_if_active(self, account_id: int):
+        account = self.db.get_account(account_id)
+        if not account:
+            return
+        if account["is_active"]:
+            await self.start_account(account)
+
+    async def start_all(self):
+        for account in self.db.get_accounts(include_inactive=False):
+            await self.start_account(account)
+
+    async def stop_all(self):
+        for account_id in list(self.clients):
+            await self.stop_account(account_id)
+
+    async def handle_group_message(self, account_id: int, event):
+        account = self.db.get_account(account_id)
+        if not account or not account["is_active"] or not account["is_monitoring"]:
+            return
+
+        group_id = self.db.get_setting("monitor_group_id")
+        if not group_id:
+            return
+
+        if str(event.chat_id) != str(group_id):
+            return
+
+        text = event.raw_text or ""
+        usernames = {m.group(1).lower() for m in USERNAME_RE.finditer(text)}
+        if not usernames:
+            return
+
+        for username in usernames:
+            contact, created = self.db.add_contact(
+                account_id,
+                username,
+                source="monitor",
+            )
+            if created:
+                await self.bot.notify_new_contact(contact)
+
+    async def handle_private_message(self, account_id: int, event):
+        if not event.is_private:
+            return
+
+        sender = await event.get_sender()
+        if not sender or getattr(sender, "bot", False):
+            return
+
+        username = getattr(sender, "username", None)
+        if not username:
+            # Для этого сценария username нужен, чтобы однозначно связать диалог.
+            return
+
+        contact = self.db.get_contact_for_user(account_id, username)
+
+        # Критически важно: чужие ЛС не считаются ответом.
+        if not contact or contact["status"] != "waiting_reply":
+            return
+
+        text = event.raw_text or ""
+        user_id = str(getattr(sender, "id", "")) or None
+
+        self.db.save_reply(
+            contact["id"],
+            account_id,
+            username,
+            user_id,
+            text,
+        )
+        self.db.mark_reply(contact["id"])
+        self.db.increment_stat(account_id, "replies")
+
+        await self.bot.notify_reply(
+            account_id,
+            contact,
+            text,
+        )
+
+        # Второй текст отправляется только после подтверждённого ответа
+        # на первое сообщение.
+        await self.send_second_message(contact["id"], account_id, username)
+
+    async def send_second_message(
+        self,
+        contact_id: int,
+        account_id: int,
+        username: str,
+    ) -> bool:
+        text = self.db.get_text(2).strip()
+        if not text:
+            self.db.set_contact_status(
+                contact_id,
+                "error",
+                error="Второй текст не установлен",
+            )
+            await self.bot.notify_error(
+                account_id,
+                username,
+                "Второй текст не установлен",
+            )
+            return False
+
+        return await self._send(
+            contact_id,
+            account_id,
+            username,
+            text,
+            step=2,
+        )
+
+    async def send_first_message(self, contact_id: int) -> bool:
+        contact = self.db.get_contact(contact_id)
+        if not contact or contact["status"] != "pending":
+            return False
+
+        text = self.db.get_text(1).strip()
+        if not text:
+            await self.bot.notify_error(
+                contact["account_id"],
+                contact["username"],
+                "Первый текст не установлен",
+            )
+            return False
+
+        return await self._send(
+            contact_id,
+            contact["account_id"],
+            contact["username"],
+            text,
+            step=1,
+        )
+
+    async def _send(
+        self,
+        contact_id: int,
+        account_id: int,
+        username: str,
+        text: str,
+        step: int,
+    ) -> bool:
+        running = self.clients.get(account_id)
+        if not running:
+            error = "Аккаунт не запущен"
+            self.db.set_contact_status(contact_id, "error", error=error)
+            self.db.increment_stat(account_id, "errors")
+            await self.bot.notify_error(account_id, username, error)
+            return False
+
+        async with self.lock_for(account_id):
+            try:
+                entity = await running.client.get_entity(username)
+                await running.client.send_message(entity, text)
+
+                if step == 1:
+                    self.db.mark_first_sent(contact_id)
+                    self.db.increment_stat(account_id, "sent_first")
+                else:
+                    self.db.mark_second_sent(contact_id)
+                    self.db.increment_stat(account_id, "sent_second")
+
+                logger.info(
+                    "Sent step %s from account %s to @%s",
+                    step,
+                    account_id,
+                    username,
+                )
+                return True
+
+            except FloodWaitError as e:
+                error = f"FloodWait: Telegram просит подождать {e.seconds} сек."
+                self.db.set_contact_status(contact_id, "error", error=error)
+                self.db.increment_stat(account_id, "errors")
+                await self.bot.notify_error(account_id, username, error)
+                return False
+
+            except PeerFloodError:
+                error = "SPAM/FLOOD ограничение Telegram"
+                self.db.set_contact_status(contact_id, "blocked", error=error)
+                self.db.increment_stat(account_id, "errors")
+                await self.bot.notify_error(account_id, username, error)
+                return False
+
+            except (UsernameInvalidError, UsernameNotOccupiedError) as e:
+                error = f"Username недоступен: {type(e).__name__}"
+                self.db.set_contact_status(contact_id, "error", error=error)
+                self.db.increment_stat(account_id, "errors")
+                await self.bot.notify_error(account_id, username, error)
+                return False
+
+            except UserPrivacyRestrictedError:
+                error = "Пользователь ограничил получение сообщений"
+                self.db.set_contact_status(contact_id, "error", error=error)
+                self.db.increment_stat(account_id, "errors")
+                await self.bot.notify_error(account_id, username, error)
+                return False
+
+            except UserNotMutualContactError:
+                error = "Telegram не разрешил отправку этому пользователю"
+                self.db.set_contact_status(contact_id, "error", error=error)
+                self.db.increment_stat(account_id, "errors")
+                await self.bot.notify_error(account_id, username, error)
+                return False
+
+            except RPCError as e:
+                error = f"Telegram RPC error: {e}"
+                self.db.set_contact_status(contact_id, "error", error=error)
+                self.db.increment_stat(account_id, "errors")
+                await self.bot.notify_error(account_id, username, error)
+                return False
+
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+                self.db.set_contact_status(contact_id, "error", error=error)
+                self.db.increment_stat(account_id, "errors")
+                await self.bot.notify_error(account_id, username, error)
+                logger.exception("Message sending failed")
+                return False
+
+
+# ============================================================
+# BOT SYSTEM
+# ============================================================
+class BotSystem:
+    def __init__(self):
+        self.db = Database(DATABASE_FILE)
+        self.bot_app: Optional[Application] = None
+        self.manager = UserBotManager(self.db, self)
+
+    # ---------- helpers ----------
+    def is_admin(self, update: Update) -> bool:
+        user = update.effective_user
+        return bool(user and user.id in ADMIN_IDS)
+
+    async def deny(self, update: Update):
+        if update.callback_query:
+            await update.callback_query.answer("Нет доступа", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("⛔ Доступ запрещён")
+
+    async def edit_or_reply(self, update: Update, text: str, markup=None):
+        if update.callback_query:
+            try:
+                await update.callback_query.edit_message_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                await update.callback_query.message.reply_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+        else:
+            await update.message.reply_text(
+                text,
+                reply_markup=markup,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+    # ---------- notifications ----------
+    async def send_to_admins(self, text: str, markup=None):
         if not self.bot_app:
             return
-        
-        pending = self.db.get_pending_users_by_account(account_id)
-        found_user = None
-        for f in pending:
-            if f['username'] == username:
-                found_user = f
-                break
-        
-        if not found_user:
-            return
-        
-        found_id = found_user['id']
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("✍️ Написать", callback_data=f"write_{found_id}_{account_id}"),
-                InlineKeyboardButton("⏭️ Пропустить", callback_data=f"skip_{found_id}_{account_id}")
-            ]
-        ]
-        
         for admin_id in ADMIN_IDS:
             try:
                 await self.bot_app.bot.send_message(
-                    admin_id,
-                    f"👤 **Найден новый пользователь!**\n"
-                    f"📌 @{username}\n"
-                    f"🤖 Аккаунт: {phone}\n\n"
-                    f"Выберите действие:",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode='Markdown'
+                    chat_id=admin_id,
+                    text=text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.MARKDOWN,
                 )
-                logger.info(f"✅ Кнопки отправлены админу для @{username}")
-            except Exception as e:
-                logger.error(f"Ошибка отправки кнопок админу: {e}")
-    
-    async def _handle_incoming(self, account_id: int, event):
-        """Обработка личных сообщений - ответы пользователей"""
-        try:
-            msg = event.message
-            sender = await event.get_sender()
-            
-            if not sender or sender.bot or not event.is_private:
-                return
-            
-            username = sender.username or sender.first_name or str(sender.id)
-            user_id = str(sender.id)
-            text = msg.text or ""
-            
-            self.db.save_reply(account_id, username, user_id, text)
-            self.db.inc_stats(account_id, 'replies')
-            
-            await self._send_reply_to_group(account_id, username, text)
-            await self._process_user_reply(account_id, username)
-            
-        except Exception as e:
-            logger.error(f"Ошибка обработки входящего: {e}")
-    
-    async def _send_reply_to_group(self, account_id: int, username: str, text: str):
-        """Отправка ответа в группу для ответов"""
-        if not self.bot_app:
-            return
-        
-        reply_group = self.db.get_reply_group()
-        if not reply_group:
-            return
-        
+            except Exception:
+                logger.exception("Cannot notify admin %s", admin_id)
+
+    async def notify_new_contact(self, contact: dict):
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✍️ Написать",
+                        callback_data=f"write:{contact['id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "⏭ Пропустить",
+                        callback_data=f"skip:{contact['id']}",
+                    ),
+                ]
+            ]
+        )
+        await self.send_to_admins(
+            "👤 *Новый username*\n\n"
+            f"Username: `@{contact['username']}`\n"
+            f"Аккаунт ID: `{contact['account_id']}`\n"
+            f"Источник: `{contact['source']}`\n\n"
+            "Выберите действие:",
+            keyboard,
+        )
+
+    async def notify_reply(self, account_id: int, contact: dict, text: str):
         account = self.db.get_account(account_id)
-        
+        phone = account["phone"] if account else "неизвестен"
+
+        await self.send_to_reply_group(
+            "📩 *Новый ответ*\n\n"
+            f"👤 Пользователь: `@{contact['username']}`\n"
+            f"🤖 Аккаунт: `{phone}`\n"
+            f"🆔 Account ID: `{account_id}`\n\n"
+            f"💬 Ответ:\n{text[:3500]}"
+        )
+
+    async def send_to_reply_group(self, text: str):
+        group_id = self.db.get_setting("reply_group_id")
+        if not group_id or not self.bot_app:
+            return
         try:
             await self.bot_app.bot.send_message(
-                reply_group['group_id'],
-                f"📩 **Ответ от пользователя**\n"
-                f"👤 @{username}\n"
-                f"🤖 Аккаунт: {account['phone'] if account else 'Неизвестно'}\n"
-                f"📝 Текст: {text[:500]}"
+                chat_id=int(group_id),
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
             )
-        except Exception as e:
-            logger.error(f"Ошибка отправки в группу: {e}")
-    
-    async def _process_user_reply(self, account_id: int, username: str):
-        """Обработка ответа - отправка 2-го текста"""
-        queue = self.db.get_queue_by_username(username, account_id)
-        
-        for q in queue:
-            if q['step'] == 1:
-                text2 = self.db.get_text(2)
-                if text2:
-                    await self._send_message(account_id, username, q['id'], text2, 2)
-                else:
-                    self.db.update_queue_status(q['id'], 'delivered')
-    
-    async def _send_message(self, account_id: int, username: str, queue_id: int, text: str, step: int):
-        """Отправка сообщения пользователю"""
-        try:
-            client = self.clients.get(account_id, {}).get('client')
-            if not client:
-                return False
-            
-            entity = await client.get_entity(username)
-            await client.send_message(entity, text)
-            
-            self.db.update_queue_status(queue_id, 'sent')
-            self.db.update_queue_step(queue_id, step)
-            self.db.inc_stats(account_id, 'sent')
-            
-            logger.info(f"✅ Отправлено @{username} с аккаунта {account_id}")
-            return True
-            
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
-            return await self._send_message(account_id, username, queue_id, text, step)
-            
-        except PeerFloodError:
-            self.db.update_queue_status(queue_id, 'blocked', 'SPAM блок')
-            self.db.inc_stats(account_id, 'errors')
-            for admin_id in ADMIN_IDS:
-                try:
-                    await self.bot_app.bot.send_message(
-                        admin_id,
-                        f"⚠️ **SPAM блок!**\nАккаунт: {self.clients.get(account_id, {}).get('phone', 'Неизвестно')}\nПользователь: @{username}"
-                    )
-                except:
-                    pass
-            return False
-            
-        except Exception as e:
-            self.db.update_queue_status(queue_id, 'error', str(e))
-            self.db.inc_stats(account_id, 'errors')
-            return False
-    
-    async def send_first_message(self, found_id: int, account_id: int):
-        """Отправка 1-го текста найденному пользователю"""
-        found = self.db.get_pending_users()
-        user = None
-        for f in found:
-            if f['id'] == found_id:
-                user = f
-                break
-        
-        if not user:
-            return False
-        
-        text1 = self.db.get_text(1)
-        if not text1:
-            return False
-        
-        queue_id = self.db.add_to_queue(account_id, user['username'], 1)
-        result = await self._send_message(account_id, user['username'], queue_id, text1, 1)
-        
-        if result:
-            self.db.update_found_status(found_id, 'processed')
-        
-        return result
-    
-    async def run_all(self):
-        """Запуск всех аккаунтов"""
-        accounts = self.db.get_accounts(active_only=True)
-        for account in accounts:
-            await self.start_account(
-                account['id'],
-                account['phone'],
-                account['session_name']
-            )
-    
-    async def stop_all(self):
-        self.running = False
-        for account_id in list(self.clients.keys()):
-            await self.stop_account(account_id)
+        except Exception:
+            logger.exception("Cannot send to reply group")
 
-# ==================== ОСНОВНОЙ БОТ ====================
+    async def notify_error(self, account_id: int, username: str, error: str):
+        account = self.db.get_account(account_id)
+        phone = account["phone"] if account else "неизвестен"
 
-class BotSystem:
-    def __init__(self):
-        self.db = Database()
-        self.bot_manager = UserBotManager(self.db)
-        self.bot_app = None
-    
-    def is_admin(self, user_id: int) -> bool:
-        return user_id in ADMIN_IDS
-    
-    # ============ ГЛАВНОЕ МЕНЮ ============
-    
-    async def main_menu(self, update):
-        """Главное меню - работает с командами и кнопками"""
-        keyboard = [
-            [InlineKeyboardButton("👤 Аккаунты", callback_data="menu_accounts")],
-            [InlineKeyboardButton("📁 Группа мониторинга", callback_data="menu_group")],
-            [InlineKeyboardButton("📩 Группа для ответов", callback_data="menu_reply_group")],
-            [InlineKeyboardButton("📝 Тексты", callback_data="menu_texts")],
-            [InlineKeyboardButton("🔍 Найденные", callback_data="menu_found")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
-            [InlineKeyboardButton("📨 Очередь", callback_data="menu_queue")],
-        ]
-        
-        text = "🇷🇺 **ZOV UserBot System** 🇷🇺\n\n📋 Главное меню"
-        
-        # Определяем тип update
-        if hasattr(update, 'callback_query') and update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(
-                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-                )
-            except Exception as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("Обновлено", show_alert=False)
-                else:
-                    await update.callback_query.message.reply_text(
-                        text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-                    )
-        elif hasattr(update, 'message') and update.message:
-            await update.message.reply_text(
-                text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-            )
-    
-    # ============ МЕНЮ АККАУНТОВ ============
-    
-    async def menu_accounts(self, update):
-        accounts = self.db.get_accounts(active_only=False)
-        
-        keyboard = [
-            [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add_account")],
-            [InlineKeyboardButton("🔄 Обновить", callback_data="menu_accounts")]
-        ]
-        
-        text = "👤 **АККАУНТЫ**\n━━━━━━━━━━━━━━━━━━\n"
-        
+        await self.send_to_admins(
+            "⚠️ *Ошибка отправки*\n\n"
+            f"🤖 Аккаунт: `{phone}`\n"
+            f"👤 Пользователь: `@{username}`\n"
+            f"🆔 Account ID: `{account_id}`\n\n"
+            f"Ошибка: `{error[:1500]}`"
+        )
+
+    # ---------- menu ----------
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_admin(update):
+            return await self.deny(update)
+        await self.show_main_menu(update)
+
+    async def show_main_menu(self, update: Update):
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("👤 Аккаунты", callback_data="menu:accounts"),
+                    InlineKeyboardButton("👥 Пользователи", callback_data="menu:users"),
+                ],
+                [
+                    InlineKeyboardButton("📡 Мониторинг", callback_data="menu:monitor"),
+                    InlineKeyboardButton("💬 Ответы", callback_data="menu:reply_group"),
+                ],
+                [
+                    InlineKeyboardButton("📝 Тексты", callback_data="menu:texts"),
+                    InlineKeyboardButton("📊 Статистика", callback_data="menu:stats"),
+                ],
+            ]
+        )
+        await self.edit_or_reply(
+            update,
+            "*USERBOT MANAGER*\n\nВыберите раздел:",
+            keyboard,
+        )
+
+    # ---------- accounts ----------
+    async def menu_accounts(self, update: Update, context=None):
+        accounts = self.db.get_accounts()
+        lines = ["👤 *АККАУНТЫ*", ""]
+
+        keyboard = [[
+            InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add_account")
+        ]]
+
         if not accounts:
-            text += "📭 Нет аккаунтов"
+            lines.append("Нет аккаунтов.")
         else:
-            for acc in accounts:
-                status = "✅" if acc['is_active'] else "⛔"
-                monitor = "🔍" if acc.get('is_monitoring', 1) else "⛔"
-                online = "🟢" if acc['id'] in self.bot_manager.clients else "🔴"
-                
-                text += f"\n{status} {acc['phone']} {online}\n"
-                text += f"  ID: `{acc['id']}` | Мониторинг: {monitor}\n"
-                text += f"  Отправлено: {acc.get('sent', 0)} | Ответов: {acc.get('replies', 0)}\n"
-                
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"{'⏸️' if acc['is_active'] else '▶️'} Аккаунт",
-                        callback_data=f"toggle_acc_{acc['id']}"
-                    ),
-                    InlineKeyboardButton(
-                        f"{'🔍' if acc.get('is_monitoring', 1) else '⛔'} Мониторинг",
-                        callback_data=f"toggle_mon_{acc['id']}"
-                    ),
-                    InlineKeyboardButton(
-                        f"🗑️ Удалить",
-                        callback_data=f"del_acc_{acc['id']}"
-                    )
-                ])
-                keyboard.append([])
-        
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
-        
-        if hasattr(update, 'callback_query') and update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(
-                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+            for a in accounts:
+                online = "🟢" if a["id"] in self.manager.clients else "🔴"
+                active = "✅" if a["is_active"] else "⛔"
+                monitor = "🔍" if a["is_monitoring"] else "🚫"
+
+                lines.extend(
+                    [
+                        f"{online} {active} `{a['phone']}`",
+                        f"   Мониторинг: {monitor}",
+                        "",
+                    ]
                 )
-            except Exception as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("Обновлено", show_alert=False)
-                else:
-                    await update.callback_query.message.reply_text(
-                        text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-                    )
-    
-    # ============ ДОБАВЛЕНИЕ АККАУНТА ============
-    
-    async def add_account_start(self, update, context):
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text(
-            "📱 **Добавление аккаунта**\n\n"
-            "Введите номер телефона:\n`+71234567890`\n\n"
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            f"{'⏸' if a['is_active'] else '▶️'} Аккаунт",
+                            callback_data=f"account_active:{a['id']}",
+                        ),
+                        InlineKeyboardButton(
+                            f"{'🔍' if a['is_monitoring'] else '🚫'} Мониторинг",
+                            callback_data=f"account_monitor:{a['id']}",
+                        ),
+                    ]
+                )
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            "🗑 Удалить",
+                            callback_data=f"account_delete:{a['id']}",
+                        )
+                    ]
+                )
+
+        keyboard.append(
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")]
+        )
+
+        await self.edit_or_reply(update, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+
+    # ---------- add account ----------
+    async def add_account_start(self, update: Update, context):
+        if not self.is_admin(update):
+            return await self.deny(update)
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "📱 *Добавление Telegram-аккаунта*\n\n"
+            "Введи номер телефона в международном формате.\n"
+            "Например: `+370...`\n\n"
             "Для отмены: /cancel",
-            parse_mode='Markdown'
+            parse_mode=ParseMode.MARKDOWN,
         )
         return AUTH_PHONE
-    
-    async def add_account_phone(self, update, context):
+
+    async def add_account_phone(self, update: Update, context):
         phone = update.message.text.strip()
-        if not phone.startswith('+') or not phone[1:].isdigit():
-            await update.message.reply_text("❌ Неверный формат. Используйте +71234567890")
+        if not re.fullmatch(r"\+\d{5,15}", phone):
+            await update.message.reply_text("❌ Неверный формат номера.")
             return AUTH_PHONE
-        
+
         if self.db.get_account_by_phone(phone):
-            await update.message.reply_text(f"❌ Аккаунт {phone} уже существует")
+            await update.message.reply_text("❌ Такой аккаунт уже есть.")
             return AUTH_PHONE
-        
-        context.user_data['phone'] = phone
-        
+
+        session_name = "user_" + re.sub(r"\D", "", phone)
+        client = TelegramClient(
+            str(SESSIONS_DIR / session_name),
+            API_ID,
+            API_HASH,
+        )
+
         try:
-            session_name = f"user_{phone.replace('+', '')}"
-            client = TelegramClient(f"{SESSIONS_DIR}/{session_name}", API_ID, API_HASH)
             await client.connect()
             await client.send_code_request(phone)
-            context.user_data['client'] = client
-            context.user_data['session_name'] = session_name
-            
+
+            context.user_data["auth_client"] = client
+            context.user_data["phone"] = phone
+            context.user_data["session_name"] = session_name
+
             await update.message.reply_text(
-                f"📱 Код отправлен на {phone}\nВведите код:"
+                "📨 Код отправлен в Telegram.\n\n"
+                "Введи код из Telegram.\n"
+                "Для отмены: /cancel"
             )
             return AUTH_CODE
-            
+
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            await client.disconnect()
+            await update.message.reply_text(f"❌ Не удалось отправить код:\n{e}")
             return ConversationHandler.END
-    
-    async def add_account_code(self, update, context):
-        code = update.message.text.strip()
-        client = context.user_data.get('client')
-        phone = context.user_data.get('phone')
-        session_name = context.user_data.get('session_name')
-        
+
+    async def add_account_code(self, update: Update, context):
+        code = update.message.text.strip().replace(" ", "")
+        client = context.user_data.get("auth_client")
+        phone = context.user_data.get("phone")
+        session_name = context.user_data.get("session_name")
+
         if not client:
-            await update.message.reply_text("❌ Ошибка. Начните заново")
+            await update.message.reply_text("❌ Сессия авторизации потеряна.")
             return ConversationHandler.END
-        
+
         try:
-            await client.sign_in(phone, code)
-            
-            if await client.is_user_authorized():
-                account_id = self.db.add_account(phone, session_name)
-                await self.bot_manager.start_account(account_id, phone, session_name)
-                
-                await update.message.reply_text(f"✅ Аккаунт {phone} добавлен и запущен!")
-                await client.disconnect()
-                context.user_data.clear()
-                return ConversationHandler.END
-            else:
-                await update.message.reply_text("❌ Ошибка авторизации")
-                return ConversationHandler.END
-                
+            await client.sign_in(phone=phone, code=code)
         except SessionPasswordNeededError:
-            await update.message.reply_text("🔐 Требуется 2FA пароль\nВведите пароль:")
+            await update.message.reply_text(
+                "🔐 На аккаунте включён 2FA.\nВведи пароль 2FA:"
+            )
             return AUTH_PASSWORD
-            
         except PhoneCodeInvalidError:
-            await update.message.reply_text("❌ Неверный код. Попробуйте снова:")
+            await update.message.reply_text("❌ Неверный код. Попробуй ещё раз.")
             return AUTH_CODE
-            
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            await client.disconnect()
+            await update.message.reply_text(f"❌ Ошибка авторизации:\n{e}")
             return ConversationHandler.END
-    
-    async def add_account_password(self, update, context):
-        password = update.message.text.strip()
-        client = context.user_data.get('client')
-        phone = context.user_data.get('phone')
-        session_name = context.user_data.get('session_name')
-        
+
+        return await self.finish_account_auth(update, context)
+
+    async def add_account_password(self, update: Update, context):
+        password = update.message.text
+        client = context.user_data.get("auth_client")
+
         if not client:
-            await update.message.reply_text("❌ Ошибка. Начните заново")
+            await update.message.reply_text("❌ Сессия авторизации потеряна.")
             return ConversationHandler.END
-        
+
         try:
             await client.sign_in(password=password)
-            
-            if await client.is_user_authorized():
-                account_id = self.db.add_account(phone, session_name)
-                await self.bot_manager.start_account(account_id, phone, session_name)
-                
-                await update.message.reply_text(f"✅ Аккаунт {phone} добавлен и запущен!")
-                await client.disconnect()
-                context.user_data.clear()
-                return ConversationHandler.END
-            else:
-                await update.message.reply_text("❌ Ошибка авторизации")
-                return ConversationHandler.END
-                
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            await update.message.reply_text(f"❌ Неверный 2FA пароль:\n{e}")
             return AUTH_PASSWORD
-    
-    # ============ ГРУППА МОНИТОРИНГА ============
-    
-    async def menu_group(self, update):
-        group = self.db.get_monitor_group()
-        
-        keyboard = [
-            [InlineKeyboardButton("📝 Установить группу", callback_data="set_group")],
-            [InlineKeyboardButton("🔄 Обновить", callback_data="menu_group")]
-        ]
-        
-        text = "📁 **ГРУППА ДЛЯ МОНИТОРИНГА**\n━━━━━━━━━━━━━━━━━━\n"
-        
-        if group:
-            text += f"📌 {group['group_name']}\n"
-            text += f"🆔 ID: `{group['group_id']}`"
-        else:
-            text += "❌ Группа не установлена"
-        
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
-        
-        if hasattr(update, 'callback_query') and update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(
-                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+
+        return await self.finish_account_auth(update, context)
+
+    async def finish_account_auth(self, update: Update, context):
+        client = context.user_data["auth_client"]
+        phone = context.user_data["phone"]
+        session_name = context.user_data["session_name"]
+
+        try:
+            me = await client.get_me()
+            if not me:
+                raise RuntimeError("Не удалось получить профиль аккаунта.")
+
+            # Закрываем временный клиент.
+            await client.disconnect()
+
+            account_id = self.db.add_account(phone, session_name)
+            account = self.db.get_account(account_id)
+
+            ok = await self.manager.start_account(account)
+            if not ok:
+                self.db.set_account_active(account_id, False)
+                await update.message.reply_text(
+                    "⚠️ Авторизация успешна, но аккаунт не удалось запустить.\n"
+                    "Проверь API_ID/API_HASH и session."
                 )
-            except Exception as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("Обновлено", show_alert=False)
-    
-    async def set_group_start(self, update, context):
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text(
-            "📁 **Установка группы для мониторинга**\n\n"
-            "Введите ID группы:\n`-100123456789`\n\n"
-            "⚠️ Аккаунты должны быть в этой группе!\n\n"
-            "Для отмены: /cancel",
-            parse_mode='Markdown'
+            else:
+                await update.message.reply_text(
+                    f"✅ Аккаунт добавлен.\n\n"
+                    f"Телефон: `{phone}`\n"
+                    f"Username: `@{getattr(me, 'username', '') or 'нет'}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await update.message.reply_text(f"❌ Ошибка сохранения аккаунта:\n{e}")
+        finally:
+            context.user_data.clear()
+
+        return ConversationHandler.END
+
+    # ---------- groups ----------
+    async def menu_monitor(self, update: Update, context=None):
+        group_id = self.db.get_setting("monitor_group_id")
+        text = (
+            "📡 *МОНИТОРИНГ*\n\n"
+            f"Группа: `{group_id}`" if group_id else "📡 *МОНИТОРИНГ*\n\nГруппа не установлена."
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📝 Установить группу", callback_data="set_monitor_group")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")],
+            ]
+        )
+        await self.edit_or_reply(update, text, keyboard)
+
+    async def set_monitor_group_start(self, update: Update, context):
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "📡 Введи ID группы.\n\n"
+            "Обычно это что-то вроде `-1001234567890`.\n"
+            "Укажи ID группы, где аккаунты находятся и где появляются @username.\n\n"
+            "/cancel — отмена",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return ADD_GROUP
-    
-    async def set_group_confirm(self, update, context):
+
+    async def set_monitor_group_confirm(self, update: Update, context):
         group_id = update.message.text.strip()
-        
-        try:
-            await self.bot_app.bot.send_message(
-                group_id,
-                "✅ Группа установлена для мониторинга!"
-            )
-            self.db.set_monitor_group(group_id, f"Группа {group_id}")
-            
-            await update.message.reply_text(
-                f"✅ Группа установлена для мониторинга!\nID: `{group_id}`",
-                parse_mode='Markdown'
-            )
-            
-        except Exception as e:
-            await update.message.reply_text(
-                f"❌ Ошибка: бот не может отправить сообщение.\n"
-                f"Убедитесь, что бот добавлен в группу.\n\n"
-                f"Ошибка: {str(e)[:100]}"
-            )
+        if not re.fullmatch(r"-?\d+", group_id):
+            await update.message.reply_text("❌ ID должен быть числом.")
             return ADD_GROUP
-        
-        context.user_data.clear()
+
+        self.db.set_setting("monitor_group_id", group_id)
+        await update.message.reply_text("✅ Группа мониторинга сохранена.")
         return ConversationHandler.END
-    
-    # ============ ГРУППА ДЛЯ ОТВЕТОВ ============
-    
-    async def menu_reply_group(self, update):
-        group = self.db.get_reply_group()
-        
-        keyboard = [
-            [InlineKeyboardButton("📝 Установить группу", callback_data="set_reply_group")],
-            [InlineKeyboardButton("🔄 Обновить", callback_data="menu_reply_group")]
-        ]
-        
-        text = "📩 **ГРУППА ДЛЯ ОТВЕТОВ**\n━━━━━━━━━━━━━━━━━━\n"
-        
-        if group:
-            text += f"📌 {group['group_name']}\n"
-            text += f"🆔 ID: `{group['group_id']}`"
-        else:
-            text += "❌ Группа не установлена"
-        
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
-        
-        if hasattr(update, 'callback_query') and update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(
-                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-                )
-            except Exception as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("Обновлено", show_alert=False)
-    
-    async def set_reply_group_start(self, update, context):
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text(
-            "📩 **Установка группы для ответов**\n\n"
-            "Введите ID группы:\n`-100123456789`\n\n"
-            "⚠️ Бот должен быть админом в этой группе!\n\n"
-            "Для отмены: /cancel",
-            parse_mode='Markdown'
+
+    async def menu_reply_group(self, update: Update, context=None):
+        group_id = self.db.get_setting("reply_group_id")
+        text = (
+            "💬 *ГРУППА ОТВЕТОВ*\n\n"
+            f"Группа: `{group_id}`" if group_id else "💬 *ГРУППА ОТВЕТОВ*\n\nГруппа не установлена."
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📝 Установить группу", callback_data="set_reply_group")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")],
+            ]
+        )
+        await self.edit_or_reply(update, text, keyboard)
+
+    async def set_reply_group_start(self, update: Update, context):
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "💬 Введи ID группы, куда бот будет присылать ответы.\n\n"
+            "Бот должен находиться в этой группе.\n\n"
+            "/cancel — отмена",
         )
         return ADD_REPLY_GROUP
-    
-    async def set_reply_group_confirm(self, update, context):
+
+    async def set_reply_group_confirm(self, update: Update, context):
         group_id = update.message.text.strip()
-        
+        if not re.fullmatch(r"-?\d+", group_id):
+            await update.message.reply_text("❌ ID должен быть числом.")
+            return ADD_REPLY_GROUP
+
         try:
             await self.bot_app.bot.send_message(
-                group_id,
-                "✅ Группа установлена для получения ответов!"
+                chat_id=int(group_id),
+                text="✅ Тест: группа ответов подключена.",
             )
-            self.db.set_reply_group(group_id, f"Группа {group_id}")
-            
-            await update.message.reply_text(
-                f"✅ Группа установлена для ответов!\nID: `{group_id}`",
-                parse_mode='Markdown'
-            )
-            
         except Exception as e:
             await update.message.reply_text(
-                f"❌ Ошибка: бот не может отправить сообщение.\n"
-                f"Убедитесь, что бот добавлен в группу и является админом.\n\n"
-                f"Ошибка: {str(e)[:100]}"
+                f"❌ Бот не смог отправить тестовое сообщение:\n{e}"
             )
             return ADD_REPLY_GROUP
-        
-        context.user_data.clear()
+
+        self.db.set_setting("reply_group_id", group_id)
+        await update.message.reply_text("✅ Группа ответов сохранена.")
         return ConversationHandler.END
-    
-    # ============ ТЕКСТЫ ============
-    
-    async def menu_texts(self, update):
-        text1 = self.db.get_text(1) or "Не установлен"
-        text2 = self.db.get_text(2) or "Не установлен"
-        
-        keyboard = [
-            [InlineKeyboardButton("📝 1-й текст", callback_data="edit_text_1")],
-            [InlineKeyboardButton("📝 2-й текст", callback_data="edit_text_2")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-        ]
-        
-        text = (
-            f"📝 **ТЕКСТЫ**\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"📌 **1-й текст (первое сообщение):**\n{text1}\n\n"
-            f"📌 **2-й текст (после ответа):**\n{text2}"
+
+    # ---------- texts ----------
+    async def menu_texts(self, update: Update, context=None):
+        t1 = self.db.get_text(1)
+        t2 = self.db.get_text(2)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📝 Изменить 1-й текст", callback_data="edit_text:1")],
+                [InlineKeyboardButton("📝 Изменить 2-й текст", callback_data="edit_text:2")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")],
+            ]
         )
-        
-        if hasattr(update, 'callback_query') and update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(
-                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-                )
-            except Exception as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("Обновлено", show_alert=False)
-    
-    async def edit_text_start(self, update, context):
-        query = update.callback_query
-        await query.answer()
-        
-        step = 1 if "edit_text_1" in query.data else 2
-        context.user_data['edit_step'] = step
-        
-        current = self.db.get_text(step) or "Не установлен"
-        
-        await query.edit_message_text(
-            f"📝 **Редактирование {step}-го текста**\n\n"
-            f"Текущий текст:\n{current}\n\n"
-            f"Введите новый текст:\n\n"
-            f"Для отмены: /cancel",
-            parse_mode='Markdown'
+
+        await self.edit_or_reply(
+            update,
+            "📝 *ТЕКСТЫ*\n\n"
+            f"*1-й текст:*\n{t1}\n\n"
+            f"*2-й текст:*\n{t2}",
+            keyboard,
         )
-        return EDIT_TEXTS
-    
-    async def edit_text_confirm(self, update, context):
+
+    async def edit_text_start(self, update: Update, context):
+        step = int(update.callback_query.data.split(":")[1])
+        context.user_data["edit_step"] = step
+
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            f"📝 Введи новый текст для шага {step}.\n\n/cancel — отмена"
+        )
+        return EDIT_TEXT_1 if step == 1 else EDIT_TEXT_2
+
+    async def edit_text_confirm(self, update: Update, context):
+        step = context.user_data.get("edit_step")
+        if step not in (1, 2):
+            return ConversationHandler.END
+
         text = update.message.text.strip()
-        step = context.user_data.get('edit_step', 1)
-        
+        if not text:
+            await update.message.reply_text("❌ Текст не может быть пустым.")
+            return EDIT_TEXT_1 if step == 1 else EDIT_TEXT_2
+
         self.db.set_text(step, text)
-        
-        await update.message.reply_text(f"✅ {step}-й текст сохранён!")
         context.user_data.clear()
+        await update.message.reply_text(f"✅ Текст {step} сохранён.")
         return ConversationHandler.END
-    
-    # ============ НАЙДЕННЫЕ ============
-    
-    async def menu_found(self, update):
-        found = self.db.get_pending_users()
-        
+
+    # ---------- manual users ----------
+    async def menu_users(self, update: Update, context=None):
+        pending = self.db.get_pending(20)
         keyboard = [
-            [InlineKeyboardButton("🔄 Обновить", callback_data="menu_found")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+            [InlineKeyboardButton("➕ Добавить username", callback_data="manual_add")]
         ]
-        
-        text = "🔍 **НАЙДЕННЫЕ ПОЛЬЗОВАТЕЛИ**\n━━━━━━━━━━━━━━━━━━\n"
-        
-        if not found:
-            text += "📭 Нет новых пользователей"
-        else:
-            for f in found[:20]:
-                text += f"\n👤 @{f['username']}\n"
-                text += f"  Аккаунт: {f['account_id']}\n"
-                text += f"  Найден: {f['found_at'][:16]}\n"
-        
-        if hasattr(update, 'callback_query') and update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(
-                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+
+        if pending:
+            for c in pending:
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            f"✍️ @{c['username']} / {c['phone']}",
+                            callback_data=f"write:{c['id']}",
+                        )
+                    ]
                 )
-            except Exception as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("Обновлено", show_alert=False)
-    
-    # ============ СТАТИСТИКА ============
-    
-    async def menu_stats(self, update):
-        accounts = self.db.get_accounts(active_only=False)
-        queue = self.db.get_queue_stats()
-        found = len(self.db.get_pending_users())
-        
-        text = "📊 **СТАТИСТИКА**\n━━━━━━━━━━━━━━━━━━\n\n"
-        text += f"👤 Аккаунтов: {len(accounts)}\n"
-        text += f"🟢 Онлайн: {len(self.bot_manager.clients)}\n"
-        text += f"🔍 В ожидании: {found}\n"
-        text += f"📨 В очереди: {queue.get('pending', 0)}\n"
-        text += f"✅ Отправлено: {queue.get('sent', 0)}\n"
-        text += f"⚠️ Ошибок: {queue.get('errors', 0)}\n\n"
-        
-        text += "📊 **По аккаунтам:**\n"
-        for acc in accounts:
-            text += f"  {acc['phone']}: отправлено {acc.get('sent', 0)}, ответов {acc.get('replies', 0)}\n"
-        
+
+        keyboard.append(
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")]
+        )
+
+        text = f"👥 *ПОЛЬЗОВАТЕЛИ*\n\nОжидают решения: `{len(pending)}`"
+        await self.edit_or_reply(update, text, InlineKeyboardMarkup(keyboard))
+
+    async def manual_add_start(self, update: Update, context):
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "👤 Введи username.\n\n"
+            "Например: `@example`\n\n"
+            "/cancel — отмена"
+        )
+        return MANUAL_USERNAME
+
+    async def manual_add_confirm(self, update: Update, context):
+        username = update.message.text.strip().lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+            await update.message.reply_text("❌ Некорректный username.")
+            return MANUAL_USERNAME
+
+        accounts = self.db.get_accounts(include_inactive=False)
+        if not accounts:
+            await update.message.reply_text("❌ Нет активных аккаунтов.")
+            return ConversationHandler.END
+
+        context.user_data["manual_username"] = username.lower()
+
         keyboard = [
-            [InlineKeyboardButton("🔄 Обновить", callback_data="menu_stats")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-        ]
-        
-        if hasattr(update, 'callback_query') and update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(
-                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+            [
+                InlineKeyboardButton(
+                    f"{a['phone']}",
+                    callback_data=f"manual_account:{a['id']}",
                 )
-            except Exception as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("Обновлено", show_alert=False)
-    
-    # ============ ОЧЕРЕДЬ ============
-    
-    async def menu_queue(self, update):
-        queue = self.db.get_queue()
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 Обновить", callback_data="menu_queue")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+            ]
+            for a in accounts
         ]
-        
-        text = "📨 **ОЧЕРЕДЬ**\n━━━━━━━━━━━━━━━━━━\n"
-        
-        if not queue:
-            text += "📭 Очередь пуста"
-        else:
-            for q in queue[:20]:
-                text += f"\n👤 @{q['username']}\n"
-                text += f"  Аккаунт: {q['account_id']}\n"
-                text += f"  Шаг: {q['step']}\n"
-        
-        if hasattr(update, 'callback_query') and update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(
-                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-                )
-            except Exception as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("Обновлено", show_alert=False)
-    
-    # ============ ОБРАБОТЧИКИ КНОПОК ============
-    
-    async def handle_callback(self, update, context):
+        keyboard.append(
+            [InlineKeyboardButton("❌ Отмена", callback_data="menu:users")]
+        )
+
+        await update.message.reply_text(
+            f"👤 `@{username}`\n\nВыбери аккаунт:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    # ---------- callbacks ----------
+    async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_admin(update):
+            return await self.deny(update)
+
         query = update.callback_query
         await query.answer()
         data = query.data
-        
-        # Навигация
-        if data == "back_main":
-            await self.main_menu(update)
-            return
-        
-        if data == "menu_accounts":
-            await self.menu_accounts(update)
-            return
-        
-        if data == "menu_group":
-            await self.menu_group(update)
-            return
-        
-        if data == "menu_reply_group":
-            await self.menu_reply_group(update)
-            return
-        
-        if data == "menu_texts":
-            await self.menu_texts(update)
-            return
-        
-        if data == "menu_found":
-            await self.menu_found(update)
-            return
-        
-        if data == "menu_stats":
-            await self.menu_stats(update)
-            return
-        
-        if data == "menu_queue":
-            await self.menu_queue(update)
-            return
-        
-        # Добавление аккаунта
+
+        if data == "menu:main":
+            return await self.show_main_menu(update)
+
+        if data == "menu:accounts":
+            return await self.menu_accounts(update, context)
+
+        if data == "menu:users":
+            return await self.menu_users(update, context)
+
+        if data == "menu:monitor":
+            return await self.menu_monitor(update, context)
+
+        if data == "menu:reply_group":
+            return await self.menu_reply_group(update, context)
+
+        if data == "menu:texts":
+            return await self.menu_texts(update, context)
+
+        if data == "menu:stats":
+            return await self.menu_stats(update, context)
+
         if data == "add_account":
-            await self.add_account_start(update, context)
-            return
-        
-        # Группы
-        if data == "set_group":
-            await self.set_group_start(update, context)
-            return
-        
+            return await self.add_account_start(update, context)
+
+        if data == "set_monitor_group":
+            return await self.set_monitor_group_start(update, context)
+
         if data == "set_reply_group":
-            await self.set_reply_group_start(update, context)
-            return
-        
-        # Тексты
-        if data.startswith("edit_text_"):
-            await self.edit_text_start(update, context)
-            return
-        
-        # Включение/выключение аккаунта
-        if data.startswith("toggle_acc_"):
-            account_id = int(data.split("_")[2])
-            acc = self.db.get_account(account_id)
-            if acc:
-                new_status = not bool(acc['is_active'])
-                self.db.toggle_account(account_id, new_status)
-                if not new_status:
-                    await self.bot_manager.stop_account(account_id)
-                await self.menu_accounts(update)
-            return
-        
-        # Включение/выключение мониторинга
-        if data.startswith("toggle_mon_"):
-            account_id = int(data.split("_")[2])
-            acc = self.db.get_account(account_id)
-            if acc:
-                new_status = not bool(acc.get('is_monitoring', 1))
-                self.db.toggle_monitoring(account_id, new_status)
-                await self.menu_accounts(update)
-            return
-        
-        # Удаление аккаунта
-        if data.startswith("del_acc_"):
-            account_id = int(data.split("_")[2])
-            await self.bot_manager.stop_account(account_id)
-            self.db.delete_account(account_id)
-            await self.menu_accounts(update)
-            return
-        
-        # Написать или пропустить
-        if data.startswith("write_"):
-            parts = data.split("_")
-            found_id = int(parts[1])
-            account_id = int(parts[2])
-            
-            result = await self.bot_manager.send_first_message(found_id, account_id)
-            
-            if result:
-                await query.edit_message_text(
-                    f"✅ Сообщение отправлено!\n"
-                    f"Пользователь получит 1-й текст.\n"
-                    f"После ответа будет отправлен 2-й текст."
+            return await self.set_reply_group_start(update, context)
+
+        if data == "manual_add":
+            return await self.manual_add_start(update, context)
+
+        if data.startswith("edit_text:"):
+            return await self.edit_text_start(update, context)
+
+        if data.startswith("write:"):
+            contact_id = int(data.split(":")[1])
+            contact = self.db.get_contact(contact_id)
+
+            if not contact:
+                return await query.edit_message_text("❌ Пользователь не найден.")
+
+            if contact["status"] != "pending":
+                return await query.edit_message_text(
+                    f"ℹ️ Пользователь уже обработан.\nСтатус: {contact['status']}"
+                )
+
+            ok = await self.manager.send_first_message(contact_id)
+
+            if ok:
+                return await query.edit_message_text(
+                    f"✅ Первое сообщение отправлено.\n\n"
+                    f"@{contact['username']}\n"
+                    f"Аккаунт: {contact['account_id']}\n\n"
+                    f"Теперь система ждёт ответ."
+                )
+
+            return await query.edit_message_text(
+                f"❌ Отправить сообщение не получилось.\n\n"
+                f"@{contact['username']}\n"
+                f"Подробная ошибка отправлена администратору."
+            )
+
+        if data.startswith("skip:"):
+            contact_id = int(data.split(":")[1])
+            contact = self.db.get_contact(contact_id)
+            if contact:
+                self.db.set_contact_status(contact_id, "skipped")
+            return await query.edit_message_text("⏭ Пользователь пропущен.")
+
+        if data.startswith("manual_account:"):
+            account_id = int(data.split(":")[1])
+            username = context.user_data.get("manual_username")
+            if not username:
+                return await query.edit_message_text("❌ Данные потеряны. Добавь username ещё раз.")
+
+            contact, created = self.db.add_contact(
+                account_id,
+                username,
+                source="manual",
+            )
+            context.user_data.pop("manual_username", None)
+
+            if not created:
+                return await query.edit_message_text(
+                    f"ℹ️ `@{username}` уже существует для этого аккаунта.\n"
+                    f"Статус: `{contact['status']}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✍️ Написать",
+                            callback_data=f"write:{contact['id']}",
+                        ),
+                        InlineKeyboardButton(
+                            "⏭ Пропустить",
+                            callback_data=f"skip:{contact['id']}",
+                        ),
+                    ]
+                ]
+            )
+            return await query.edit_message_text(
+                f"👤 `@{username}` добавлен.\n\nВыбери действие:",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+        if data.startswith("account_monitor:"):
+            account_id = int(data.split(":")[1])
+            account = self.db.get_account(account_id)
+            if account:
+                self.db.set_monitoring(
+                    account_id,
+                    not bool(account["is_monitoring"]),
+                )
+            return await self.menu_accounts(update, context)
+
+        if data.startswith("account_active:"):
+            account_id = int(data.split(":")[1])
+            account = self.db.get_account(account_id)
+            if not account:
+                return await query.edit_message_text("❌ Аккаунт не найден.")
+
+            new_active = not bool(account["is_active"])
+            self.db.set_account_active(account_id, new_active)
+
+            if new_active:
+                await self.manager.start_account(
+                    self.db.get_account(account_id)
                 )
             else:
-                await query.edit_message_text(
-                    f"❌ Ошибка отправки.\n"
-                    f"Проверьте аккаунт и текст."
-                )
-            return
-        
-        if data.startswith("skip_"):
-            parts = data.split("_")
-            found_id = int(parts[1])
-            
-            self.db.skip_found_user(found_id)
-            await query.edit_message_text("✅ Пользователь пропущен")
-            return
-    
-    # ============ КОМАНДЫ ============
-    
-    async def start(self, update, context):
-        if not self.is_admin(update.effective_user.id):
-            await update.message.reply_text("⛔ Доступ запрещён")
-            return
-        await self.main_menu(update)
-    
-    async def cancel(self, update, context):
+                await self.manager.stop_account(account_id)
+
+            return await self.menu_accounts(update, context)
+
+        if data.startswith("account_delete:"):
+            account_id = int(data.split(":")[1])
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🗑 Да, удалить",
+                            callback_data=f"account_delete_confirm:{account_id}",
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Отмена",
+                            callback_data="menu:accounts",
+                        ),
+                    ]
+                ]
+            )
+            return await query.edit_message_text(
+                "⚠️ *Удалить аккаунт?*\n\n"
+                "Связанные контакты будут удалены из базы.",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+        if data.startswith("account_delete_confirm:"):
+            account_id = int(data.split(":")[1])
+            account = self.db.get_account(account_id)
+            if account:
+                await self.manager.stop_account(account_id)
+                session_file = SESSIONS_DIR / account["session_name"]
+                self.db.delete_account(account_id)
+
+                # Удаляем локальную session после удаления из БД.
+                for p in (
+                    session_file,
+                    Path(str(session_file) + "-journal"),
+                ):
+                    try:
+                        if p.exists():
+                            p.unlink()
+                    except Exception:
+                        logger.exception("Cannot delete session file %s", p)
+
+            return await self.menu_accounts(update, context)
+
+    async def menu_stats(self, update: Update, context=None):
+        stats = self.db.get_stats()
+        pending = self.db.pending_count()
+
+        lines = [
+            "📊 *СТАТИСТИКА*",
+            "",
+            f"Ожидают: `{pending}`",
+            f"Онлайн: `{len(self.manager.clients)}`",
+            "",
+        ]
+
+        for s in stats:
+            lines.append(
+                f"`{s['phone']}` — "
+                f"1-й: {s['sent_first']} | "
+                f"2-й: {s['sent_second']} | "
+                f"ответы: {s['replies']} | "
+                f"ошибки: {s['errors']}"
+            )
+
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")]]
+        )
+        await self.edit_or_reply(update, "\n".join(lines), keyboard)
+
+    # ---------- cancel ----------
+    async def cancel(self, update: Update, context):
+        client = context.user_data.pop("auth_client", None)
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
         context.user_data.clear()
-        await update.message.reply_text("✅ Операция отменена")
-        await self.main_menu(update)
-    
-    # ============ ЗАПУСК ============
-    
-    async def run(self):
-        self.bot_app = Application.builder().token(BOT_TOKEN).build()
-        self.bot_manager.set_bot_app(self.bot_app)
-        
-        # ConversationHandler
+        await update.message.reply_text("✅ Операция отменена.")
+        return ConversationHandler.END
+
+    # ---------- startup ----------
+    def build_application(self):
+        app = Application.builder().token(BOT_TOKEN).build()
+        self.bot_app = app
+
         conv = ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(self.add_account_start, pattern="^add_account$"),
-                CallbackQueryHandler(self.set_group_start, pattern="^set_group$"),
-                CallbackQueryHandler(self.set_reply_group_start, pattern="^set_reply_group$"),
-                CallbackQueryHandler(self.edit_text_start, pattern="^edit_text_"),
+                CallbackQueryHandler(
+                    self.add_account_start,
+                    pattern=r"^add_account$",
+                ),
+                CallbackQueryHandler(
+                    self.set_monitor_group_start,
+                    pattern=r"^set_monitor_group$",
+                ),
+                CallbackQueryHandler(
+                    self.set_reply_group_start,
+                    pattern=r"^set_reply_group$",
+                ),
+                CallbackQueryHandler(
+                    self.edit_text_start,
+                    pattern=r"^edit_text:\d+$",
+                ),
+                CallbackQueryHandler(
+                    self.manual_add_start,
+                    pattern=r"^manual_add$",
+                ),
             ],
             states={
-                AUTH_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_account_phone)],
-                AUTH_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_account_code)],
-                AUTH_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_account_password)],
-                ADD_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_group_confirm)],
-                ADD_REPLY_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_reply_group_confirm)],
-                EDIT_TEXTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_text_confirm)],
+                AUTH_PHONE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_account_phone)
+                ],
+                AUTH_CODE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_account_code)
+                ],
+                AUTH_PASSWORD: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_account_password)
+                ],
+                ADD_GROUP: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_monitor_group_confirm)
+                ],
+                ADD_REPLY_GROUP: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_reply_group_confirm)
+                ],
+                EDIT_TEXT_1: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_text_confirm)
+                ],
+                EDIT_TEXT_2: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_text_confirm)
+                ],
+                MANUAL_USERNAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_add_confirm)
+                ],
             },
-            fallbacks=[CommandHandler('cancel', self.cancel)],
+            fallbacks=[
+                CommandHandler("cancel", self.cancel),
+            ],
+            allow_reentry=True,
         )
-        
-        self.bot_app.add_handler(conv)
-        self.bot_app.add_handler(CommandHandler('start', self.start))
-        self.bot_app.add_handler(CommandHandler('menu', self.start))
-        self.bot_app.add_handler(CallbackQueryHandler(self.handle_callback))
-        
-        # Запускаем юзерботов
-        asyncio.create_task(self.bot_manager.run_all())
-        
-        await self.bot_app.initialize()
-        await self.bot_app.start()
-        await self.bot_app.updater.start_polling()
-        
-        try:
-            while True:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            await self.bot_manager.stop_all()
-            await self.bot_app.updater.stop()
-            await self.bot_app.stop()
 
-# ==================== ЗАПУСК ====================
+        app.add_handler(conv)
+        app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("menu", self.start))
+        app.add_handler(CommandHandler("cancel", self.cancel))
+        app.add_handler(CallbackQueryHandler(self.callback))
+
+        return app
+
+    async def run(self):
+        if BOT_TOKEN == "PASTE_NEW_BOT_TOKEN_HERE":
+            raise RuntimeError("Укажи новый BOT_TOKEN в CONFIG.")
+        if API_ID == 12345678 or API_HASH == "PASTE_NEW_API_HASH_HERE":
+            raise RuntimeError("Укажи API_ID и API_HASH в CONFIG.")
+        if not ADMIN_IDS or 123456789 in ADMIN_IDS:
+            raise RuntimeError("Укажи реальные ADMIN_IDS в CONFIG.")
+
+        app = self.build_application()
+
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+
+        try:
+            await self.manager.start_all()
+            logger.info("Bot started.")
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            await self.manager.stop_all()
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+
 
 async def main():
     system = BotSystem()
     await system.run()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n⏹ Система остановлена")
+        pass
