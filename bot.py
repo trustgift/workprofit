@@ -34,13 +34,10 @@ signal.signal(signal.SIGTERM, signal_handler)
 # CONFIG (ЗАМЕНИТЕ НА СВОИ ДАННЫЕ)
 # ============================================================
 BOT_TOKEN = "8948221161:AAHLPfFUmK1QyRGVcaM8UVchByrxAmCkA8s"
-API_ID = 21969974
-API_HASH = "f4e1c8ac63d2581760288435b3cd9091"
+API_ID = 26259835
+API_HASH = "3fa32264398920f001dd2428b42060f6"
 
-ADMIN_IDS = {
-    662024823,
-    743954332,
-    616409698,
+ADMIN_IDS = {8986358602,8566976864
 }
 
 # Для Render - используем /tmp для временных файлов
