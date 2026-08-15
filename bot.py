@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -13,6 +12,7 @@ Telegram UserBot Manager
 - Per-account monitoring switch
 - Error / flood notifications
 - SQLite persistence
+- Кликабельные юзернеймы в уведомлениях
 """
 
 import asyncio
@@ -55,15 +55,14 @@ from telegram.ext import (
 # ============================================================
 # CONFIG
 # ============================================================
-# НЕ вставляй сюда старый токен из присланного файла.
-# Сначала отзови его через BotFather и создай новый.
-BOT_TOKEN = "8849260350:AAE_q7ptHKPX6y8A-o4kVDSuNO0Lu1s7Avk"
+BOT_TOKEN = "8849260350:AAH2kSCYtFUckF1k8W3naDDVDPSxcVqwHu0"
 API_ID = 20734425
 API_HASH = "f72fa8d1d63a8f984e47a115c76df123"
 
 ADMIN_IDS = {
     8772186742,8986358602 # замени на свои Telegram user ID
 }
+
 SESSIONS_DIR = Path("sessions")
 DATABASE_FILE = Path("data.db")
 
@@ -265,11 +264,11 @@ class Database:
 
     # ---------- contacts ----------
     def add_contact(
-        self,
-        account_id: int,
-        username: str,
-        source: str = "manual",
-        user_id: Optional[str] = None,
+            self,
+            account_id: int,
+            username: str,
+            source: str = "manual",
+            user_id: Optional[str] = None,
     ):
         username = username.lstrip("@").strip().lower()
         with closing(self.connect()) as db:
@@ -326,11 +325,11 @@ class Database:
             return [dict(x) for x in rows]
 
     def set_contact_status(
-        self,
-        contact_id: int,
-        status: str,
-        *,
-        error: Optional[str] = None,
+            self,
+            contact_id: int,
+            status: str,
+            *,
+            error: Optional[str] = None,
     ):
         with closing(self.connect()) as db:
             db.execute(
@@ -385,12 +384,12 @@ class Database:
             db.commit()
 
     def save_reply(
-        self,
-        contact_id: Optional[int],
-        account_id: int,
-        username: str,
-        user_id: Optional[str],
-        text: str,
+            self,
+            contact_id: Optional[int],
+            account_id: int,
+            username: str,
+            user_id: Optional[str],
+            text: str,
     ):
         with closing(self.connect()) as db:
             db.execute(
@@ -566,12 +565,10 @@ class UserBotManager:
 
         username = getattr(sender, "username", None)
         if not username:
-            # Для этого сценария username нужен, чтобы однозначно связать диалог.
             return
 
         contact = self.db.get_contact_for_user(account_id, username)
 
-        # Критически важно: чужие ЛС не считаются ответом.
         if not contact or contact["status"] != "waiting_reply":
             return
 
@@ -594,15 +591,13 @@ class UserBotManager:
             text,
         )
 
-        # Второй текст отправляется только после подтверждённого ответа
-        # на первое сообщение.
         await self.send_second_message(contact["id"], account_id, username)
 
     async def send_second_message(
-        self,
-        contact_id: int,
-        account_id: int,
-        username: str,
+            self,
+            contact_id: int,
+            account_id: int,
+            username: str,
     ) -> bool:
         text = self.db.get_text(2).strip()
         if not text:
@@ -649,12 +644,12 @@ class UserBotManager:
         )
 
     async def _send(
-        self,
-        contact_id: int,
-        account_id: int,
-        username: str,
-        text: str,
-        step: int,
+            self,
+            contact_id: int,
+            account_id: int,
+            username: str,
+            text: str,
+            step: int,
     ) -> bool:
         running = self.clients.get(account_id)
         if not running:
@@ -806,9 +801,12 @@ class BotSystem:
                 ]
             ]
         )
+
+        username = contact['username']
+
         await self.send_to_admins(
             "👤 *Новый username*\n\n"
-            f"Username: `@{contact['username']}`\n"
+            f"Username: [@{username}](https://t.me/{username})\n"
             f"Аккаунт ID: `{contact['account_id']}`\n"
             f"Источник: `{contact['source']}`\n\n"
             "Выберите действие:",
@@ -818,10 +816,11 @@ class BotSystem:
     async def notify_reply(self, account_id: int, contact: dict, text: str):
         account = self.db.get_account(account_id)
         phone = account["phone"] if account else "неизвестен"
+        username = contact['username']
 
         await self.send_to_reply_group(
             "📩 *Новый ответ*\n\n"
-            f"👤 Пользователь: `@{contact['username']}`\n"
+            f"👤 Пользователь: [@{username}](https://t.me/{username})\n"
             f"🤖 Аккаунт: `{phone}`\n"
             f"🆔 Account ID: `{account_id}`\n\n"
             f"💬 Ответ:\n{text[:3500]}"
@@ -847,7 +846,7 @@ class BotSystem:
         await self.send_to_admins(
             "⚠️ *Ошибка отправки*\n\n"
             f"🤖 Аккаунт: `{phone}`\n"
-            f"👤 Пользователь: `@{username}`\n"
+            f"👤 Пользователь: [@{username}](https://t.me/{username})\n"
             f"🆔 Account ID: `{account_id}`\n\n"
             f"Ошибка: `{error[:1500]}`"
         )
@@ -1036,7 +1035,6 @@ class BotSystem:
             if not me:
                 raise RuntimeError("Не удалось получить профиль аккаунта.")
 
-            # Закрываем временный клиент.
             await client.disconnect()
 
             account_id = self.db.add_account(phone, session_name)
@@ -1440,10 +1438,9 @@ class BotSystem:
                 session_file = SESSIONS_DIR / account["session_name"]
                 self.db.delete_account(account_id)
 
-                # Удаляем локальную session после удаления из БД.
                 for p in (
-                    session_file,
-                    Path(str(session_file) + "-journal"),
+                        session_file,
+                        Path(str(session_file) + "-journal"),
                 ):
                     try:
                         if p.exists():
