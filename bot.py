@@ -2,70 +2,53 @@
 # -*- coding: utf-8 -*-
 
 """
-Telegram UserBot Manager
-- Telethon user accounts
-- Monitoring one Telegram group for @usernames
-- Manual approval: "Написать" / "Пропустить"
-- Manual username adding
-- Two-step message flow: first text -> wait for reply -> second text
-- Reply forwarding to an admin group
-- Per-account monitoring switch
-- Error / flood notifications
-- SQLite persistence
-- Кликабельные юзернеймы в уведомлениях
+Telegram UserBot Manager - ДЛЯ RENDER
+Адаптирован для работы на Render.com
 """
 
+import os
+import sys
 import asyncio
 import logging
 import re
 import sqlite3
+import signal
+import threading
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
-from telethon import TelegramClient, events
-from telethon.errors import (
-    FloodWaitError,
-    PeerFloodError,
-    UserPrivacyRestrictedError,
-    UserNotMutualContactError,
-    UsernameInvalidError,
-    UsernameNotOccupiedError,
-    RPCError,
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-)
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-)
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ============================================================
-# CONFIG
+# ОБРАБОТКА СИГНАЛОВ ДЛЯ КОРРЕКТНОЙ ОСТАНОВКИ
+# ============================================================
+def signal_handler(sig, frame):
+    print(f"\n⏹ Получен сигнал {sig}. Останавливаю бота...")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# ============================================================
+# CONFIG (ЗАМЕНИТЕ НА СВОИ ДАННЫЕ)
 # ============================================================
 BOT_TOKEN = "8948221161:AAHLPfFUmK1QyRGVcaM8UVchByrxAmCkA8s"
-API_ID = 20734425
-API_HASH = "f72fa8d1d63a8f984e47a115c76df123"
+API_ID = 21969974
+API_HASH = "f4e1c8ac63d2581760288435b3cd9091"
 
 ADMIN_IDS = {
-    8772186742,8986358602 # замени на свои Telegram user ID
+    662024823,
+    743954332,
+    616409698,
 }
 
-SESSIONS_DIR = Path("sessions")
-DATABASE_FILE = Path("data.db")
+# Для Render - используем /tmp для временных файлов
+BASE_DIR = Path("/tmp") if os.path.exists("/tmp") else Path(".")
+SESSIONS_DIR = BASE_DIR / "sessions"
+DATABASE_FILE = BASE_DIR / "data.db"
 
+# Создаём папки
 SESSIONS_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
@@ -88,6 +71,56 @@ USERNAME_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_]{5,32})(?![\w])")
     MANUAL_USERNAME,
 ) = range(8)
 
+# ============================================================
+# ЗАПУСК ВЕБ-СЕРВЕРА ДЛЯ RENDER
+# ============================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"✅ Health check server running on port {port}")
+    server.serve_forever()
+
+# Запускаем в отдельном потоке
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
+
+# ============================================================
+# ИМПОРТЫ (после настройки, чтобы не было конфликтов)
+# ============================================================
+from telethon import TelegramClient, events
+from telethon.errors import (
+    FloodWaitError,
+    PeerFloodError,
+    UserPrivacyRestrictedError,
+    UserNotMutualContactError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+    RPCError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+)
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+from telegram.request import HTTPXRequest
 
 # ============================================================
 # DATABASE
@@ -264,11 +297,11 @@ class Database:
 
     # ---------- contacts ----------
     def add_contact(
-            self,
-            account_id: int,
-            username: str,
-            source: str = "manual",
-            user_id: Optional[str] = None,
+        self,
+        account_id: int,
+        username: str,
+        source: str = "manual",
+        user_id: Optional[str] = None,
     ):
         username = username.lstrip("@").strip().lower()
         with closing(self.connect()) as db:
@@ -325,11 +358,11 @@ class Database:
             return [dict(x) for x in rows]
 
     def set_contact_status(
-            self,
-            contact_id: int,
-            status: str,
-            *,
-            error: Optional[str] = None,
+        self,
+        contact_id: int,
+        status: str,
+        *,
+        error: Optional[str] = None,
     ):
         with closing(self.connect()) as db:
             db.execute(
@@ -384,12 +417,12 @@ class Database:
             db.commit()
 
     def save_reply(
-            self,
-            contact_id: Optional[int],
-            account_id: int,
-            username: str,
-            user_id: Optional[str],
-            text: str,
+        self,
+        contact_id: Optional[int],
+        account_id: int,
+        username: str,
+        user_id: Optional[str],
+        text: str,
     ):
         with closing(self.connect()) as db:
             db.execute(
@@ -435,6 +468,8 @@ class Database:
             ).fetchone()[0]
 
 
+db = Database(DATABASE_FILE)
+
 # ============================================================
 # USERBOT MANAGER
 # ============================================================
@@ -445,11 +480,11 @@ class RunningAccount:
 
 
 class UserBotManager:
-    def __init__(self, db: Database, bot: "BotSystem"):
-        self.db = db
+    def __init__(self, bot: "BotSystem"):
         self.bot = bot
         self.clients: dict[int, RunningAccount] = {}
         self._locks: dict[int, asyncio.Lock] = {}
+        self.running = True
 
     def lock_for(self, account_id: int):
         if account_id not in self._locks:
@@ -514,27 +549,21 @@ class UserBotManager:
         except Exception:
             logger.exception("Error stopping account %s", account_id)
 
-    async def restart_if_active(self, account_id: int):
-        account = self.db.get_account(account_id)
-        if not account:
-            return
-        if account["is_active"]:
-            await self.start_account(account)
-
     async def start_all(self):
-        for account in self.db.get_accounts(include_inactive=False):
+        for account in db.get_accounts(include_inactive=False):
             await self.start_account(account)
 
     async def stop_all(self):
+        self.running = False
         for account_id in list(self.clients):
             await self.stop_account(account_id)
 
     async def handle_group_message(self, account_id: int, event):
-        account = self.db.get_account(account_id)
+        account = db.get_account(account_id)
         if not account or not account["is_active"] or not account["is_monitoring"]:
             return
 
-        group_id = self.db.get_setting("monitor_group_id")
+        group_id = db.get_setting("monitor_group_id")
         if not group_id:
             return
 
@@ -547,7 +576,7 @@ class UserBotManager:
             return
 
         for username in usernames:
-            contact, created = self.db.add_contact(
+            contact, created = db.add_contact(
                 account_id,
                 username,
                 source="monitor",
@@ -567,7 +596,7 @@ class UserBotManager:
         if not username:
             return
 
-        contact = self.db.get_contact_for_user(account_id, username)
+        contact = db.get_contact_for_user(account_id, username)
 
         if not contact or contact["status"] != "waiting_reply":
             return
@@ -575,15 +604,15 @@ class UserBotManager:
         text = event.raw_text or ""
         user_id = str(getattr(sender, "id", "")) or None
 
-        self.db.save_reply(
+        db.save_reply(
             contact["id"],
             account_id,
             username,
             user_id,
             text,
         )
-        self.db.mark_reply(contact["id"])
-        self.db.increment_stat(account_id, "replies")
+        db.mark_reply(contact["id"])
+        db.increment_stat(account_id, "replies")
 
         await self.bot.notify_reply(
             account_id,
@@ -594,14 +623,14 @@ class UserBotManager:
         await self.send_second_message(contact["id"], account_id, username)
 
     async def send_second_message(
-            self,
-            contact_id: int,
-            account_id: int,
-            username: str,
+        self,
+        contact_id: int,
+        account_id: int,
+        username: str,
     ) -> bool:
-        text = self.db.get_text(2).strip()
+        text = db.get_text(2).strip()
         if not text:
-            self.db.set_contact_status(
+            db.set_contact_status(
                 contact_id,
                 "error",
                 error="Второй текст не установлен",
@@ -622,11 +651,11 @@ class UserBotManager:
         )
 
     async def send_first_message(self, contact_id: int) -> bool:
-        contact = self.db.get_contact(contact_id)
+        contact = db.get_contact(contact_id)
         if not contact or contact["status"] != "pending":
             return False
 
-        text = self.db.get_text(1).strip()
+        text = db.get_text(1).strip()
         if not text:
             await self.bot.notify_error(
                 contact["account_id"],
@@ -644,18 +673,18 @@ class UserBotManager:
         )
 
     async def _send(
-            self,
-            contact_id: int,
-            account_id: int,
-            username: str,
-            text: str,
-            step: int,
+        self,
+        contact_id: int,
+        account_id: int,
+        username: str,
+        text: str,
+        step: int,
     ) -> bool:
         running = self.clients.get(account_id)
         if not running:
             error = "Аккаунт не запущен"
-            self.db.set_contact_status(contact_id, "error", error=error)
-            self.db.increment_stat(account_id, "errors")
+            db.set_contact_status(contact_id, "error", error=error)
+            db.increment_stat(account_id, "errors")
             await self.bot.notify_error(account_id, username, error)
             return False
 
@@ -665,11 +694,11 @@ class UserBotManager:
                 await running.client.send_message(entity, text)
 
                 if step == 1:
-                    self.db.mark_first_sent(contact_id)
-                    self.db.increment_stat(account_id, "sent_first")
+                    db.mark_first_sent(contact_id)
+                    db.increment_stat(account_id, "sent_first")
                 else:
-                    self.db.mark_second_sent(contact_id)
-                    self.db.increment_stat(account_id, "sent_second")
+                    db.mark_second_sent(contact_id)
+                    db.increment_stat(account_id, "sent_second")
 
                 logger.info(
                     "Sent step %s from account %s to @%s",
@@ -681,50 +710,50 @@ class UserBotManager:
 
             except FloodWaitError as e:
                 error = f"FloodWait: Telegram просит подождать {e.seconds} сек."
-                self.db.set_contact_status(contact_id, "error", error=error)
-                self.db.increment_stat(account_id, "errors")
+                db.set_contact_status(contact_id, "error", error=error)
+                db.increment_stat(account_id, "errors")
                 await self.bot.notify_error(account_id, username, error)
                 return False
 
             except PeerFloodError:
                 error = "SPAM/FLOOD ограничение Telegram"
-                self.db.set_contact_status(contact_id, "blocked", error=error)
-                self.db.increment_stat(account_id, "errors")
+                db.set_contact_status(contact_id, "blocked", error=error)
+                db.increment_stat(account_id, "errors")
                 await self.bot.notify_error(account_id, username, error)
                 return False
 
             except (UsernameInvalidError, UsernameNotOccupiedError) as e:
                 error = f"Username недоступен: {type(e).__name__}"
-                self.db.set_contact_status(contact_id, "error", error=error)
-                self.db.increment_stat(account_id, "errors")
+                db.set_contact_status(contact_id, "error", error=error)
+                db.increment_stat(account_id, "errors")
                 await self.bot.notify_error(account_id, username, error)
                 return False
 
             except UserPrivacyRestrictedError:
                 error = "Пользователь ограничил получение сообщений"
-                self.db.set_contact_status(contact_id, "error", error=error)
-                self.db.increment_stat(account_id, "errors")
+                db.set_contact_status(contact_id, "error", error=error)
+                db.increment_stat(account_id, "errors")
                 await self.bot.notify_error(account_id, username, error)
                 return False
 
             except UserNotMutualContactError:
                 error = "Telegram не разрешил отправку этому пользователю"
-                self.db.set_contact_status(contact_id, "error", error=error)
-                self.db.increment_stat(account_id, "errors")
+                db.set_contact_status(contact_id, "error", error=error)
+                db.increment_stat(account_id, "errors")
                 await self.bot.notify_error(account_id, username, error)
                 return False
 
             except RPCError as e:
                 error = f"Telegram RPC error: {e}"
-                self.db.set_contact_status(contact_id, "error", error=error)
-                self.db.increment_stat(account_id, "errors")
+                db.set_contact_status(contact_id, "error", error=error)
+                db.increment_stat(account_id, "errors")
                 await self.bot.notify_error(account_id, username, error)
                 return False
 
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
-                self.db.set_contact_status(contact_id, "error", error=error)
-                self.db.increment_stat(account_id, "errors")
+                db.set_contact_status(contact_id, "error", error=error)
+                db.increment_stat(account_id, "errors")
                 await self.bot.notify_error(account_id, username, error)
                 logger.exception("Message sending failed")
                 return False
@@ -735,9 +764,8 @@ class UserBotManager:
 # ============================================================
 class BotSystem:
     def __init__(self):
-        self.db = Database(DATABASE_FILE)
         self.bot_app: Optional[Application] = None
-        self.manager = UserBotManager(self.db, self)
+        self.manager = UserBotManager(self)
 
     # ---------- helpers ----------
     def is_admin(self, update: Update) -> bool:
@@ -801,9 +829,9 @@ class BotSystem:
                 ]
             ]
         )
-
+        
         username = contact['username']
-
+        
         await self.send_to_admins(
             "👤 *Новый username*\n\n"
             f"Username: [@{username}](https://t.me/{username})\n"
@@ -814,7 +842,7 @@ class BotSystem:
         )
 
     async def notify_reply(self, account_id: int, contact: dict, text: str):
-        account = self.db.get_account(account_id)
+        account = db.get_account(account_id)
         phone = account["phone"] if account else "неизвестен"
         username = contact['username']
 
@@ -827,7 +855,7 @@ class BotSystem:
         )
 
     async def send_to_reply_group(self, text: str):
-        group_id = self.db.get_setting("reply_group_id")
+        group_id = db.get_setting("reply_group_id")
         if not group_id or not self.bot_app:
             return
         try:
@@ -840,7 +868,7 @@ class BotSystem:
             logger.exception("Cannot send to reply group")
 
     async def notify_error(self, account_id: int, username: str, error: str):
-        account = self.db.get_account(account_id)
+        account = db.get_account(account_id)
         phone = account["phone"] if account else "неизвестен"
 
         await self.send_to_admins(
@@ -882,7 +910,7 @@ class BotSystem:
 
     # ---------- accounts ----------
     async def menu_accounts(self, update: Update, context=None):
-        accounts = self.db.get_accounts()
+        accounts = db.get_accounts()
         lines = ["👤 *АККАУНТЫ*", ""]
 
         keyboard = [[
@@ -951,7 +979,7 @@ class BotSystem:
             await update.message.reply_text("❌ Неверный формат номера.")
             return AUTH_PHONE
 
-        if self.db.get_account_by_phone(phone):
+        if db.get_account_by_phone(phone):
             await update.message.reply_text("❌ Такой аккаунт уже есть.")
             return AUTH_PHONE
 
@@ -1037,12 +1065,12 @@ class BotSystem:
 
             await client.disconnect()
 
-            account_id = self.db.add_account(phone, session_name)
-            account = self.db.get_account(account_id)
+            account_id = db.add_account(phone, session_name)
+            account = db.get_account(account_id)
 
             ok = await self.manager.start_account(account)
             if not ok:
-                self.db.set_account_active(account_id, False)
+                db.set_account_active(account_id, False)
                 await update.message.reply_text(
                     "⚠️ Авторизация успешна, но аккаунт не удалось запустить.\n"
                     "Проверь API_ID/API_HASH и session."
@@ -1068,7 +1096,7 @@ class BotSystem:
 
     # ---------- groups ----------
     async def menu_monitor(self, update: Update, context=None):
-        group_id = self.db.get_setting("monitor_group_id")
+        group_id = db.get_setting("monitor_group_id")
         text = (
             "📡 *МОНИТОРИНГ*\n\n"
             f"Группа: `{group_id}`" if group_id else "📡 *МОНИТОРИНГ*\n\nГруппа не установлена."
@@ -1098,12 +1126,12 @@ class BotSystem:
             await update.message.reply_text("❌ ID должен быть числом.")
             return ADD_GROUP
 
-        self.db.set_setting("monitor_group_id", group_id)
+        db.set_setting("monitor_group_id", group_id)
         await update.message.reply_text("✅ Группа мониторинга сохранена.")
         return ConversationHandler.END
 
     async def menu_reply_group(self, update: Update, context=None):
-        group_id = self.db.get_setting("reply_group_id")
+        group_id = db.get_setting("reply_group_id")
         text = (
             "💬 *ГРУППА ОТВЕТОВ*\n\n"
             f"Группа: `{group_id}`" if group_id else "💬 *ГРУППА ОТВЕТОВ*\n\nГруппа не установлена."
@@ -1142,14 +1170,14 @@ class BotSystem:
             )
             return ADD_REPLY_GROUP
 
-        self.db.set_setting("reply_group_id", group_id)
+        db.set_setting("reply_group_id", group_id)
         await update.message.reply_text("✅ Группа ответов сохранена.")
         return ConversationHandler.END
 
     # ---------- texts ----------
     async def menu_texts(self, update: Update, context=None):
-        t1 = self.db.get_text(1)
-        t2 = self.db.get_text(2)
+        t1 = db.get_text(1)
+        t2 = db.get_text(2)
 
         keyboard = InlineKeyboardMarkup(
             [
@@ -1187,14 +1215,14 @@ class BotSystem:
             await update.message.reply_text("❌ Текст не может быть пустым.")
             return EDIT_TEXT_1 if step == 1 else EDIT_TEXT_2
 
-        self.db.set_text(step, text)
+        db.set_text(step, text)
         context.user_data.clear()
         await update.message.reply_text(f"✅ Текст {step} сохранён.")
         return ConversationHandler.END
 
     # ---------- manual users ----------
     async def menu_users(self, update: Update, context=None):
-        pending = self.db.get_pending(20)
+        pending = db.get_pending(20)
         keyboard = [
             [InlineKeyboardButton("➕ Добавить username", callback_data="manual_add")]
         ]
@@ -1232,7 +1260,7 @@ class BotSystem:
             await update.message.reply_text("❌ Некорректный username.")
             return MANUAL_USERNAME
 
-        accounts = self.db.get_accounts(include_inactive=False)
+        accounts = db.get_accounts(include_inactive=False)
         if not accounts:
             await update.message.reply_text("❌ Нет активных аккаунтов.")
             return ConversationHandler.END
@@ -1306,7 +1334,7 @@ class BotSystem:
 
         if data.startswith("write:"):
             contact_id = int(data.split(":")[1])
-            contact = self.db.get_contact(contact_id)
+            contact = db.get_contact(contact_id)
 
             if not contact:
                 return await query.edit_message_text("❌ Пользователь не найден.")
@@ -1334,9 +1362,9 @@ class BotSystem:
 
         if data.startswith("skip:"):
             contact_id = int(data.split(":")[1])
-            contact = self.db.get_contact(contact_id)
+            contact = db.get_contact(contact_id)
             if contact:
-                self.db.set_contact_status(contact_id, "skipped")
+                db.set_contact_status(contact_id, "skipped")
             return await query.edit_message_text("⏭ Пользователь пропущен.")
 
         if data.startswith("manual_account:"):
@@ -1345,7 +1373,7 @@ class BotSystem:
             if not username:
                 return await query.edit_message_text("❌ Данные потеряны. Добавь username ещё раз.")
 
-            contact, created = self.db.add_contact(
+            contact, created = db.add_contact(
                 account_id,
                 username,
                 source="manual",
@@ -1381,9 +1409,9 @@ class BotSystem:
 
         if data.startswith("account_monitor:"):
             account_id = int(data.split(":")[1])
-            account = self.db.get_account(account_id)
+            account = db.get_account(account_id)
             if account:
-                self.db.set_monitoring(
+                db.set_monitoring(
                     account_id,
                     not bool(account["is_monitoring"]),
                 )
@@ -1391,16 +1419,16 @@ class BotSystem:
 
         if data.startswith("account_active:"):
             account_id = int(data.split(":")[1])
-            account = self.db.get_account(account_id)
+            account = db.get_account(account_id)
             if not account:
                 return await query.edit_message_text("❌ Аккаунт не найден.")
 
             new_active = not bool(account["is_active"])
-            self.db.set_account_active(account_id, new_active)
+            db.set_account_active(account_id, new_active)
 
             if new_active:
                 await self.manager.start_account(
-                    self.db.get_account(account_id)
+                    db.get_account(account_id)
                 )
             else:
                 await self.manager.stop_account(account_id)
@@ -1432,15 +1460,15 @@ class BotSystem:
 
         if data.startswith("account_delete_confirm:"):
             account_id = int(data.split(":")[1])
-            account = self.db.get_account(account_id)
+            account = db.get_account(account_id)
             if account:
                 await self.manager.stop_account(account_id)
                 session_file = SESSIONS_DIR / account["session_name"]
-                self.db.delete_account(account_id)
+                db.delete_account(account_id)
 
                 for p in (
-                        session_file,
-                        Path(str(session_file) + "-journal"),
+                    session_file,
+                    Path(str(session_file) + "-journal"),
                 ):
                     try:
                         if p.exists():
@@ -1451,8 +1479,8 @@ class BotSystem:
             return await self.menu_accounts(update, context)
 
     async def menu_stats(self, update: Update, context=None):
-        stats = self.db.get_stats()
-        pending = self.db.pending_count()
+        stats = db.get_stats()
+        pending = db.pending_count()
 
         lines = [
             "📊 *СТАТИСТИКА*",
@@ -1557,38 +1585,53 @@ class BotSystem:
         return app
 
     async def run(self):
-        if BOT_TOKEN == "PASTE_NEW_BOT_TOKEN_HERE":
-            raise RuntimeError("Укажи новый BOT_TOKEN в CONFIG.")
-        if API_ID == 12345678 or API_HASH == "PASTE_NEW_API_HASH_HERE":
-            raise RuntimeError("Укажи API_ID и API_HASH в CONFIG.")
-        if not ADMIN_IDS or 123456789 in ADMIN_IDS:
-            raise RuntimeError("Укажи реальные ADMIN_IDS в CONFIG.")
+        if BOT_TOKEN == "8948221161:AAHLPfFUmK1QyRGVcaM8UVchByrxAmCkA8s":
+            # Токен уже вставлен, пропускаем
+            pass
 
         app = self.build_application()
+
+        # Удаляем вебхук перед запуском
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Webhook удалён")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось удалить webhook: {e}")
 
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
+        logger.info("✅ Бот запущен на Render!")
 
         try:
             await self.manager.start_all()
-            logger.info("Bot started.")
+            logger.info("✅ Юзерботы запущены")
+            
+            # Держим бота живым
             while True:
                 await asyncio.sleep(3600)
+                
+        except KeyboardInterrupt:
+            logger.info("⏹ Получен сигнал остановки")
         finally:
             await self.manager.stop_all()
             await app.updater.stop()
             await app.stop()
             await app.shutdown()
+            logger.info("✅ Остановка завершена")
 
 
+# ============================================================
+# ЗАПУСК
+# ============================================================
 async def main():
     system = BotSystem()
     await system.run()
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        print("\n⏹ Бот остановлен")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
