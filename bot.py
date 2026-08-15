@@ -57,14 +57,13 @@ from telegram.ext import (
 # ============================================================
 # НЕ вставляй сюда старый токен из присланного файла.
 # Сначала отзови его через BotFather и создай новый.
-BOT_TOKEN = "8849260350:AAH3YDz5Qz6KfkfTCSPO2mzRu6nGUkrcGtY"
+BOT_TOKEN = "8849260350:AAE_q7ptHKPX6y8A-o4kVDSuNO0Lu1s7Avk"
 API_ID = 20734425
 API_HASH = "f72fa8d1d63a8f984e47a115c76df123"
 
 ADMIN_IDS = {
     8772186742,8986358602 # замени на свои Telegram user ID
 }
-
 SESSIONS_DIR = Path("sessions")
 DATABASE_FILE = Path("data.db")
 
